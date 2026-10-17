@@ -1,0 +1,27 @@
+{
+  "name": "page-change-request",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "check": "biome check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@medv/finder": "^4.0.2",
+    "preact": "^10.25.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@playwright/test": "^1.51.0",
+    "@types/node": "^22.13.0",
+    "esbuild": "^0.25.0",
+    "happy-dom": "^16.8.1",
+    "tsx": "^4.19.2",
+    "typescript": "^7.0.2",
+    "vitest": "^3.0.7"
+  }
+}
