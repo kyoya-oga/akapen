@@ -1,13 +1,17 @@
 {
   "name": "page-change-request",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsx scripts/build.ts",
+    "generate:viewer": "tsx scripts/build.ts --viewer-only",
+    "pretest": "npm run generate:viewer",
     "test": "vitest run",
+    "pretest:e2e": "npm run build",
     "test:e2e": "playwright test",
     "check": "biome check .",
+    "pretypecheck": "npm run generate:viewer",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -18,8 +22,12 @@
     "@biomejs/biome": "1.9.4",
     "@playwright/test": "^1.51.0",
     "@types/node": "^22.13.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "esbuild": "^0.25.0",
     "happy-dom": "^16.8.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "tsx": "^4.19.2",
     "typescript": "^7.0.2",
     "vitest": "^3.0.7"

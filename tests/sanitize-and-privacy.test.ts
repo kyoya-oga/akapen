@@ -5,7 +5,6 @@ import {
   collectImageUrlsFromClonedRoot,
   replaceImageUrlsWithResourceHashes,
   sanitizeClonedDocument,
-  shouldExcludeSnapshotForUrl,
   syncLiveDomStateBeforeClone,
 } from "../src/core/sanitize";
 import {
@@ -84,14 +83,6 @@ describe("スナップショットからの個人情報・スクリプト・危�
     const resolvedInSanitized = resolveDomPath(doc.documentElement, locator.domPath);
     expect(resolvedInSanitized).not.toBeNull();
     expect(resolvedInSanitized?.textContent).toBe("秋の特別キャンペーン詳細はこちら");
-  });
-
-  test("マイページや購入手続きなどの対象外ページでは、個人情報保護のためスナップショットを撮らないと判定される", () => {
-    expect(shouldExcludeSnapshotForUrl("https://shop.example.com/mypage/orders")).toBe(true);
-    expect(shouldExcludeSnapshotForUrl("https://shop.example.com/checkout/confirm")).toBe(true);
-    expect(shouldExcludeSnapshotForUrl("https://shop.example.com/cart")).toBe(true);
-    expect(shouldExcludeSnapshotForUrl("https://shop.example.com/products/123")).toBe(false);
-    expect(shouldExcludeSnapshotForUrl("https://shop.example.com/campaigns/autumn")).toBe(false);
   });
 });
 

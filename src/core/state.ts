@@ -1,4 +1,5 @@
 import { computePageMetaDiffs, determineChangeType } from "./change-type";
+import { extractPathname } from "./markdown";
 import type {
   Anchor,
   AttachmentMeta,
@@ -23,13 +24,14 @@ export type AppState = {
   readonly isQuickListOpen: boolean;
   readonly barPosition: { readonly x: number; readonly y: number };
   readonly currentUrl: string;
-  readonly isSnapshotExcludedPage: boolean;
   readonly isIncognitoWarning: boolean;
   readonly hasRecentCompletedDraft: boolean;
   readonly nextSeq: number;
   readonly items: readonly Item[];
   readonly snapshots: readonly SnapshotMeta[];
   readonly attachments: readonly AttachmentMeta[];
+  /** 確定済みだが画面スナップショットの記録が終わっていない項目 */
+  readonly pendingSnapshotSeqs: readonly number[];
   readonly hoveredRect: Rect | null;
   readonly dragSelectionRect: Rect | null;
   readonly resolvedAnchors: readonly ResolvedAnchor[];
@@ -43,12 +45,9 @@ export type Effect =
   | { readonly type: "SAVE_DRAFT_DEBOUNCED" }
   | { readonly type: "CLEAR_DRAFT_DB" }
   | { readonly type: "LOAD_COMPLETED_DRAFT_FROM_DB" }
-  | {
-      readonly type: "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM";
-      readonly pendingItem: Item;
-      readonly skipSnapshot: boolean;
-    }
+  | { readonly type: "CAPTURE_SNAPSHOT_FOR_ITEM"; readonly item: Item }
   | { readonly type: "SCROLL_TO_ITEM"; readonly item: Item }
+  | { readonly type: "OPEN_EDITOR_FOR_ITEM"; readonly seq: number }
   | { readonly type: "EXPAND_EDITOR_SELECTION" }
   | { readonly type: "SHRINK_EDITOR_SELECTION" }
   | { readonly type: "COMPLETE_AND_EXPORT" }
@@ -60,11 +59,7 @@ export type AppEvent =
   | { readonly type: "SET_ALT_PRESSED"; readonly isAltPressed: boolean }
   | { readonly type: "TOGGLE_QUICK_LIST" }
   | { readonly type: "MOVE_BAR"; readonly x: number; readonly y: number }
-  | {
-      readonly type: "URL_CHANGED";
-      readonly url: string;
-      readonly isExcluded: boolean;
-    }
+  | { readonly type: "URL_CHANGED"; readonly url: string }
   | { readonly type: "SET_INCOGNITO_WARNING"; readonly isIncognito: boolean }
   | {
       readonly type: "HYDRATE_DRAFT";
@@ -102,7 +97,7 @@ export type AppEvent =
   | { readonly type: "CONFIRM_EDITOR" }
   | {
       readonly type: "SNAPSHOT_CAPTURED_FOR_ITEM";
-      readonly item: Item;
+      readonly seq: number;
       readonly snapshot?: SnapshotMeta;
     }
   | { readonly type: "DELETE_ITEM"; readonly seq: number }
@@ -112,6 +107,8 @@ export type AppEvent =
   | { readonly type: "REQUEST_COMPLETE" }
   | { readonly type: "EXPORT_FINISHED"; readonly message: string }
   | { readonly type: "OPERATION_FAILED"; readonly message: string }
+  | { readonly type: "SHOW_STATUS"; readonly message: string }
+  | { readonly type: "CLEAR_STATUS" }
   | { readonly type: "CLOSE_TOOL" };
 
 export type UpdateResult = {
@@ -119,29 +116,65 @@ export type UpdateResult = {
   readonly effects: readonly Effect[];
 };
 
-export const createInitialState = (
-  currentUrl: string,
-  isSnapshotExcludedPage: boolean,
-): AppState => ({
+export const createInitialState = (currentUrl: string): AppState => ({
   isVisible: true,
   isPaused: false,
   isAltPressed: false,
   isQuickListOpen: false,
   barPosition: { x: 24, y: 24 },
   currentUrl,
-  isSnapshotExcludedPage,
   isIncognitoWarning: false,
   hasRecentCompletedDraft: false,
   nextSeq: 1,
   items: [],
   snapshots: [],
   attachments: [],
+  pendingSnapshotSeqs: [],
   hoveredRect: null,
   dragSelectionRect: null,
   resolvedAnchors: [],
   editor: null,
   statusMessage: null,
 });
+
+const computeEditorKey = (editor: DraftEditorState): string =>
+  JSON.stringify([
+    editor.currentText,
+    editor.currentHref ?? null,
+    editor.currentMeta ?? null,
+    editor.memo,
+    editor.attachmentId ?? null,
+    editor.isDeleteRequested,
+  ]);
+
+const withPristineKey = (editor: DraftEditorState): DraftEditorState => ({
+  ...editor,
+  pristineKey: computeEditorKey(editor),
+});
+
+/** エディタを開いてから入力内容が変わったか（別の要素へ移るときの破棄確認に使う） */
+export const isEditorDirty = (editor: DraftEditorState): boolean =>
+  editor.pristineKey !== undefined && computeEditorKey(editor) !== editor.pristineKey;
+
+/** どの変更項目・開いているエディタからも参照されていないスナップショットと添付を外す */
+export const pruneUnreferencedAssets = (state: AppState): AppState => {
+  const snapshotIds = new Set(
+    state.items.flatMap((i) => (i.snapshotId !== undefined ? [i.snapshotId] : [])),
+  );
+  const attachmentIds = new Set([
+    ...state.items.flatMap((i) => i.attachmentIds),
+    ...(state.editor?.attachmentId !== undefined ? [state.editor.attachmentId] : []),
+  ]);
+  const snapshots = state.snapshots.filter((s) => snapshotIds.has(s.id));
+  const attachments = state.attachments.filter((a) => attachmentIds.has(a.id));
+  if (
+    snapshots.length === state.snapshots.length &&
+    attachments.length === state.attachments.length
+  ) {
+    return state;
+  }
+  return { ...state, snapshots, attachments };
+};
 
 const evaluateEditorChangeType = (editor: DraftEditorState): ChangeType | null => {
   const kind: TargetKind = editor.targetKind;
@@ -267,6 +300,15 @@ const buildItemFromEditor = (
 export const UNSAFE_HREF_MESSAGE =
   "リンク先に使えるのは http(s) / mailto / tel / 相対パスのみです（javascript: などは不可）";
 
+export const EMPTY_TEXT_MESSAGE =
+  "文言が空です。要素ごと消したい場合は「削除を依頼」を押してください";
+
+const isTextClearedWithoutDelete = (editor: DraftEditorState): boolean =>
+  (editor.targetKind === "text" || editor.targetKind === "link") &&
+  !editor.isDeleteRequested &&
+  editor.initialText.trim().length > 0 &&
+  editor.currentText.trim().length === 0;
+
 const hasUnsafeEditedHref = (editor: DraftEditorState): boolean =>
   editor.targetKind === "link" &&
   editor.currentHref !== undefined &&
@@ -281,62 +323,62 @@ const handleConfirmEditor = (state: AppState): UpdateResult => {
   if (hasUnsafeEditedHref(editor)) {
     return { state: { ...state, statusMessage: UNSAFE_HREF_MESSAGE }, effects: [] };
   }
+  if (isTextClearedWithoutDelete(editor)) {
+    return { state: { ...state, statusMessage: EMPTY_TEXT_MESSAGE }, effects: [] };
+  }
   const changeType = evaluateEditorChangeType(editor);
   if (changeType === null) {
     return {
-      state: { ...state, editor: null },
+      state: pruneUnreferencedAssets({ ...state, editor: null }),
       effects: [],
     };
   }
-  const pendingItem = buildItemFromEditor(state, editor, changeType);
-  const nextSeq =
-    editor.editingSeq !== undefined ? state.nextSeq : Math.max(state.nextSeq, pendingItem.seq + 1);
-  const skipSnapshot =
-    changeType === "PAGE_META" ||
-    state.isSnapshotExcludedPage ||
-    pendingItem.snapshotId !== undefined;
+  const item = buildItemFromEditor(state, editor, changeType);
+  const exists = state.items.some((i) => i.seq === item.seq);
+  const items = exists
+    ? state.items.map((i) => (i.seq === item.seq ? item : i))
+    : [...state.items, item];
+  const needsSnapshot = changeType !== "PAGE_META" && item.snapshotId === undefined;
 
+  // スナップショットの記録を待たずに一覧・バッジ・プレビューへ即座に反映する
   return {
-    state: {
+    state: pruneUnreferencedAssets({
       ...state,
-      nextSeq,
+      items,
+      nextSeq: Math.max(state.nextSeq, item.seq + 1),
+      pendingSnapshotSeqs:
+        needsSnapshot && !state.pendingSnapshotSeqs.includes(item.seq)
+          ? [...state.pendingSnapshotSeqs, item.seq]
+          : state.pendingSnapshotSeqs,
       editor: null,
       statusMessage: null,
-    },
+    }),
     effects: [
-      {
-        type: "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM",
-        pendingItem,
-        skipSnapshot,
-      },
+      { type: "SYNC_LIVE_DOM", items },
+      { type: "SAVE_DRAFT_DEBOUNCED" },
+      ...(needsSnapshot ? [{ type: "CAPTURE_SNAPSHOT_FOR_ITEM", item } as const] : []),
     ],
   };
 };
 
 const handleSnapshotCaptured = (
   state: AppState,
-  item: Item,
+  seq: number,
   snapshot: SnapshotMeta | undefined,
 ): UpdateResult => {
-  const exists = state.items.some((i) => i.seq === item.seq);
-  const updatedItems = exists
-    ? state.items.map((i) => (i.seq === item.seq ? item : i))
-    : [...state.items, item];
-  const nextSeq = exists ? state.nextSeq : Math.max(state.nextSeq, item.seq + 1);
-  const updatedSnapshots =
-    snapshot !== undefined && !state.snapshots.some((s) => s.id === snapshot.id)
-      ? [...state.snapshots, snapshot]
-      : state.snapshots;
-
-  const nextState: AppState = {
-    ...state,
-    items: updatedItems,
-    nextSeq,
-    snapshots: updatedSnapshots,
-  };
+  const pendingSnapshotSeqs = state.pendingSnapshotSeqs.filter((s) => s !== seq);
+  const target = state.items.find((i) => i.seq === seq);
+  // 記録中に取り消された・既に別のスナップショットが付いた項目には付けない
+  if (snapshot === undefined || target === undefined || target.snapshotId !== undefined) {
+    return { state: { ...state, pendingSnapshotSeqs }, effects: [] };
+  }
+  const items = state.items.map((i) => (i.seq === seq ? { ...i, snapshotId: snapshot.id } : i));
+  const snapshots = state.snapshots.some((s) => s.id === snapshot.id)
+    ? state.snapshots
+    : [...state.snapshots, snapshot];
   return {
-    state: nextState,
-    effects: [{ type: "SYNC_LIVE_DOM", items: updatedItems }, { type: "SAVE_DRAFT_DEBOUNCED" }],
+    state: { ...state, items, snapshots, pendingSnapshotSeqs },
+    effects: [{ type: "SAVE_DRAFT_DEBOUNCED" }],
   };
 };
 
@@ -359,7 +401,7 @@ const handleEditorEvent = (state: AppState, event: AppEvent): UpdateResult | nul
       return {
         state: {
           ...state,
-          editor: event.editor,
+          editor: withPristineKey(event.editor),
           hoveredRect: null,
           dragSelectionRect: null,
           isQuickListOpen: false,
@@ -367,15 +409,17 @@ const handleEditorEvent = (state: AppState, event: AppEvent): UpdateResult | nul
         effects: [],
       };
     case "UPDATE_EDITOR_LOCATOR":
-      return handleEditorUpdate(state, (ed) => ({
-        ...ed,
-        anchor: { kind: "element", locator: event.locator, rect: event.rect },
-        expansionHistory: event.expansionHistory,
-        initialText: event.initialText,
-        currentText: event.initialText,
-        hasChildFormatting: event.hasChildFormatting,
-        popoverRect: event.rect,
-      }));
+      return handleEditorUpdate(state, (ed) =>
+        withPristineKey({
+          ...ed,
+          anchor: { kind: "element", locator: event.locator, rect: event.rect },
+          expansionHistory: event.expansionHistory,
+          initialText: event.initialText,
+          currentText: event.initialText,
+          hasChildFormatting: event.hasChildFormatting,
+          popoverRect: event.rect,
+        }),
+      );
     case "UPDATE_EDITOR_TEXT":
       return handleEditorUpdate(state, (ed) => ({
         ...ed,
@@ -412,7 +456,7 @@ const handleEditorEvent = (state: AppState, event: AppEvent): UpdateResult | nul
     case "REQUEST_SHRINK_SELECTION":
       return { state, effects: [{ type: "SHRINK_EDITOR_SELECTION" }] };
     case "CLOSE_EDITOR":
-      return { state: { ...state, editor: null }, effects: [] };
+      return { state: pruneUnreferencedAssets({ ...state, editor: null }), effects: [] };
     case "CONFIRM_EDITOR":
       return handleConfirmEditor(state);
     default:
@@ -462,7 +506,6 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
         state: {
           ...state,
           currentUrl: event.url,
-          isSnapshotExcludedPage: event.isExcluded,
           editor: null,
           hoveredRect: null,
         },
@@ -482,6 +525,10 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
           snapshots: event.draft.snapshots,
           attachments: event.draft.attachments,
           hasRecentCompletedDraft: event.hasCompletedDraft,
+          statusMessage:
+            event.draft.items.length > 0
+              ? `保存されていた下書き（${event.draft.items.length}件）を復元しました`
+              : state.statusMessage,
         },
         effects: [{ type: "SYNC_LIVE_DOM", items: event.draft.items }],
       };
@@ -492,15 +539,16 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
     case "UPDATE_RESOLVED_ANCHORS":
       return { state: { ...state, resolvedAnchors: event.anchors }, effects: [] };
     case "SNAPSHOT_CAPTURED_FOR_ITEM":
-      return handleSnapshotCaptured(state, event.item, event.snapshot);
+      return handleSnapshotCaptured(state, event.seq, event.snapshot);
     case "DELETE_ITEM": {
       const remaining = state.items.filter((i) => i.seq !== event.seq);
       return {
-        state: {
+        state: pruneUnreferencedAssets({
           ...state,
           items: remaining,
+          pendingSnapshotSeqs: state.pendingSnapshotSeqs.filter((s) => s !== event.seq),
           editor: state.editor?.editingSeq === event.seq ? null : state.editor,
-        },
+        }),
         effects: [{ type: "SYNC_LIVE_DOM", items: remaining }, { type: "SAVE_DRAFT_DEBOUNCED" }],
       };
     }
@@ -509,9 +557,22 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
       if (target === undefined) {
         return { state, effects: [] };
       }
+      // 別ページの変更は、今のページの似た要素を誤って編集しないよう案内だけにする
+      if (target.url !== state.currentUrl) {
+        return {
+          state: {
+            ...state,
+            statusMessage: `#${target.seq} は別のページ（${extractPathname(target.url)}）の変更です。そのページを開くと編集できます`,
+          },
+          effects: [],
+        };
+      }
       return {
         state: { ...state, isQuickListOpen: false },
-        effects: [{ type: "SCROLL_TO_ITEM", item: target }],
+        effects: [
+          { type: "SCROLL_TO_ITEM", item: target },
+          { type: "OPEN_EDITOR_FOR_ITEM", seq: target.seq },
+        ],
       };
     }
     case "RESET_ALL_CONFIRMED":
@@ -522,6 +583,7 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
           items: [],
           snapshots: [],
           attachments: [],
+          pendingSnapshotSeqs: [],
           editor: null,
           isQuickListOpen: false,
           statusMessage: "下書きをリセットしました",
@@ -548,7 +610,10 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
         effects: [],
       };
     case "OPERATION_FAILED":
+    case "SHOW_STATUS":
       return { state: { ...state, statusMessage: event.message }, effects: [] };
+    case "CLEAR_STATUS":
+      return { state: { ...state, statusMessage: null }, effects: [] };
     case "CLOSE_TOOL":
       return {
         state: { ...state, isVisible: false, editor: null },

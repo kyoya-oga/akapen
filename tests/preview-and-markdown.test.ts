@@ -69,6 +69,109 @@ describe("対象ページのライブ書き換えと元の状態への巻き戻�
   });
 });
 
+describe("React などが管理する DOM を壊さないライブプレビュー", () => {
+  test("文言のプレビューは既存のテキストノードの値だけを書き換え、ノードの差し替え・追加・削除をしない", () => {
+    const doc = createTestDocument(
+      '<html><body><p id="price">価格 <!-- -->1000<!-- --> 円<strong>（税込）</strong></p></body></html>',
+    );
+    const url = "https://shop.example.com/products/123";
+    const p = doc.getElementById("price") as Element;
+    const nodesBefore = Array.from(p.childNodes);
+    const strongTextBefore = p.querySelector("strong")?.firstChild;
+    const item: Item = {
+      seq: 1,
+      url,
+      anchor: {
+        kind: "element",
+        locator: captureElementLocator(doc, p),
+        rect: { x: 0, y: 0, w: 10, h: 10 },
+      },
+      changeType: "TEXT_REPLACE",
+      before: "価格 1000 円（税込）",
+      after: "価格 980 円（税込・送料込み）",
+      attachmentIds: [],
+    };
+
+    const controller = createLivePreviewController();
+    controller.syncItems(doc, [item], url, () => undefined);
+
+    expect(p.textContent).toBe("価格 980 円（税込・送料込み）");
+    expect(Array.from(p.childNodes)).toEqual(nodesBefore);
+    expect(p.querySelector("strong")?.firstChild).toBe(strongTextBefore);
+
+    controller.restoreAll();
+    expect(p.textContent).toBe("価格 1000 円（税込）");
+  });
+
+  test("プレビュー中にページ側が文字を更新したら、元に戻すときはページ側の新しい値を残す", () => {
+    const doc = createTestDocument(
+      '<html><body><p id="t">在庫 <span>3</span> 点</p></body></html>',
+    );
+    const url = "https://shop.example.com/";
+    const p = doc.getElementById("t") as Element;
+    const countText = p.querySelector("span")?.firstChild as Text;
+    const item: Item = {
+      seq: 1,
+      url,
+      anchor: {
+        kind: "element",
+        locator: captureElementLocator(doc, p),
+        rect: { x: 0, y: 0, w: 10, h: 10 },
+      },
+      changeType: "TEXT_REPLACE",
+      before: "在庫 3 点",
+      after: "残りわずか",
+      attachmentIds: [],
+    };
+    const controller = createLivePreviewController();
+    controller.syncItems(doc, [item], url, () => undefined);
+
+    countText.nodeValue = "2";
+    controller.restoreAll();
+
+    expect(p.textContent).toBe("在庫 2 点");
+  });
+
+  test("プレビュー対象の要素が作り直されたことや、中の文字が変わったことを検知できる", () => {
+    const doc = createTestDocument('<html><body><main><p id="t">送料無料</p></main></body></html>');
+    const url = "https://shop.example.com/";
+    const p = doc.getElementById("t") as Element;
+    const item: Item = {
+      seq: 1,
+      url,
+      anchor: {
+        kind: "element",
+        locator: captureElementLocator(doc, p),
+        rect: { x: 0, y: 0, w: 10, h: 10 },
+      },
+      changeType: "TEXT_REPLACE",
+      before: "送料無料",
+      after: "送料 500 円",
+      attachmentIds: [],
+    };
+    const controller = createLivePreviewController();
+    controller.syncItems(doc, [item], url, () => undefined);
+    const other = doc.createElement("p");
+    doc.body.appendChild(other);
+
+    expect(controller.isAffectedByMutations([{ target: other } as unknown as MutationRecord])).toBe(
+      false,
+    );
+    expect(
+      controller.isAffectedByMutations([{ target: p.firstChild } as unknown as MutationRecord]),
+    ).toBe(true);
+
+    const replacement = doc.createElement("p");
+    replacement.id = "t";
+    replacement.textContent = "送料無料";
+    p.replaceWith(replacement);
+    expect(controller.isAffectedByMutations([])).toBe(true);
+
+    controller.resync();
+    expect(replacement.textContent).toBe("送料 500 円");
+  });
+});
+
 describe("レポート上の変更後プレビュー・差分表示・Markdown出力", () => {
   test("レポート上で「変更後」と「差分」を切り替えたとき、スナップショット内の要素に文言置換・非表示化・色枠がそれぞれ適用される", () => {
     const docAfter = createTestDocument();
@@ -171,17 +274,76 @@ describe("レポート上の変更後プレビュー・差分表示・Markdown�
 
     const ticketMd = generateTicketMarkdown(requestDoc);
     expect(ticketMd).toContain("### 変更箇所（2件）");
-    expect(ticketMd).toContain("1. **文言の差し替え**（/products/123、幅 1280px）");
-    expect(ticketMd).toContain("変更前：5,000円以上のご購入で送料無料");
+    expect(ticketMd).toContain("- **#1 文言の差し替え**（/products/123、幅 1280px）");
+    expect(ticketMd).toContain("  - 変更前：5,000円以上のご購入で送料無料");
     expect(ticketMd).toContain("変更後：3,980円以上のご購入で\\*送料無料\\*");
-    expect(ticketMd).toContain("2. **ページ情報の変更**（/）");
+    expect(ticketMd).toContain("- **#2 ページ情報の変更**（/）");
     expect(ticketMd).toContain("タイトル：「旧タイトル」→「新タイトル」");
 
     const aiMd = generateAiInstructionMarkdown(requestDoc);
-    expect(aiMd).toContain("## 1. 文言の差し替え");
-    expect(aiMd).toContain("前後の文脈：");
+    expect(aiMd).toContain("## #1 文言の差し替え");
+    expect(aiMd).toContain("直前の文脈：");
     expect(aiMd).toContain("税込・送料別");
     expect(aiMd).toContain("カートに入れる");
     expect(aiMd).toContain("セレクタの参考：");
+  });
+
+  test("番号は削除で欠番が出ても画面のバッジと同じ #番号で出力される", () => {
+    const md = generateTicketMarkdown({
+      schemaVersion: 1,
+      toolVersion: "0",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      origin: "https://shop.example.com",
+      snapshots: [],
+      attachments: [],
+      items: [
+        {
+          seq: 3,
+          url: "https://shop.example.com/",
+          anchor: { kind: "pageMeta" },
+          changeType: "PAGE_META",
+          attachmentIds: [],
+        },
+      ],
+    });
+
+    expect(md).toContain("- **#3 ページ情報の変更**");
+    expect(md).not.toMatch(/^1\./m);
+  });
+
+  test("AI 向け作業指示では、変更前の文言が記号や改行を含めて原文のままコードブロックに入り、リポジトリ検索にそのまま使える", () => {
+    const before = "価格は(税込)¥1,000! [詳細]\n*送料* `別`";
+    const aiMd = generateAiInstructionMarkdown({
+      schemaVersion: 1,
+      toolVersion: "0",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      origin: "https://shop.example.com",
+      snapshots: [],
+      attachments: [],
+      items: [
+        {
+          seq: 1,
+          url: "https://shop.example.com/",
+          anchor: {
+            kind: "element",
+            locator: {
+              selector: "p.price",
+              textQuote: { exact: before, prefix: "前の(文)", suffix: "後の[文]" },
+              tagName: "p",
+              domPath: [1, 0],
+            },
+            rect: { x: 0, y: 0, w: 10, h: 10 },
+          },
+          changeType: "TEXT_REPLACE",
+          before,
+          after: "価格は¥980",
+          attachmentIds: [],
+        },
+      ],
+    });
+
+    expect(aiMd).toContain(`変更前：\n\`\`\`text\n${before}\n\`\`\``);
+    expect(aiMd).toContain("前の(文)");
+    expect(aiMd).not.toContain("\\(");
   });
 });

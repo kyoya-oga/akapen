@@ -1,5 +1,6 @@
 import { resolveDomPath } from "../core/dom-path";
 import {
+  extractPathname,
   formatChangeTypeLabel,
   formatPageMetaFieldLabel,
   generateAiInstructionMarkdown,
@@ -13,12 +14,6 @@ import {
   decompressGzipBase64ToString,
 } from "../shell/codec";
 import type { ResourceEntry } from "../shell/snapshot-io";
-
-const decodeBase64Json = <T>(base64: string): T => {
-  const bytes = base64ToUint8Array(base64.trim());
-  const json = new TextDecoder().decode(bytes);
-  return JSON.parse(json) as T;
-};
 
 const createResourceBlobUrls = (
   resources: Readonly<Record<string, ResourceEntry>>,
@@ -259,6 +254,10 @@ const buildItemDetailCardNode = (
       ]),
       ...headRight,
     ]),
+    el("div", { class: "v-card-url" }, [
+      extractPathname(item.url),
+      ...(item.snapshotId === undefined ? ["（画面の記録なし）"] : []),
+    ]),
   ]);
   card.addEventListener("click", onSelect);
   const attId = item.attachmentIds[0];
@@ -276,12 +275,12 @@ export const mountViewerFromDom = (): void => {
     return;
   }
   const doc = JSON.parse(dataEl.textContent ?? "{}") as ChangeRequestDoc;
-  const snapshotBodies = decodeBase64Json<Readonly<Record<string, string>>>(
-    snapsEl.textContent ?? "",
-  );
-  const resources = decodeBase64Json<Readonly<Record<string, ResourceEntry>>>(
-    resEl.textContent ?? "",
-  );
+  const snapshotBodies = JSON.parse(snapsEl.textContent ?? "{}") as Readonly<
+    Record<string, string>
+  >;
+  const resources = JSON.parse(resEl.textContent ?? "{}") as Readonly<
+    Record<string, ResourceEntry>
+  >;
   const blobUrlsByHash = createResourceBlobUrls(resources);
 
   const resolveAttachmentUrl = (attachmentId: string): string | undefined => {
@@ -333,9 +332,18 @@ export const mountViewerFromDom = (): void => {
   appEl.appendChild(header);
   appEl.appendChild(main);
 
+  // 選んだ変更に画面の記録が無いときは、別ページの画面を代わりに出さない
   const getActiveSnapshotId = (): string | undefined => {
-    const sel = doc.items.find((i) => i.seq === state.selectedSeq) ?? firstVisualItem;
-    return sel?.snapshotId ?? doc.snapshots[0]?.id;
+    const selected = doc.items.find((i) => i.seq === state.selectedSeq);
+    if (selected !== undefined) {
+      return selected.snapshotId;
+    }
+    return firstVisualItem?.snapshotId ?? doc.snapshots[0]?.id;
+  };
+
+  const showNoSnapshotMessage = (): void => {
+    iframe.srcdoc =
+      '<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;color:#475569;padding:32px;">この変更には画面の記録がありません（記録に失敗したか、ページ情報の変更です）。右の一覧で内容を確認してください。</body>';
   };
 
   iframe.addEventListener("load", () => {
@@ -349,11 +357,9 @@ export const mountViewerFromDom = (): void => {
 
   const refreshIframeContent = (): void => {
     const snapId = getActiveSnapshotId();
-    if (snapId === undefined) {
-      return;
-    }
-    const compressed = snapshotBodies[snapId];
-    if (compressed === undefined) {
+    const compressed = snapId !== undefined ? snapshotBodies[snapId] : undefined;
+    if (snapId === undefined || compressed === undefined) {
+      showNoSnapshotMessage();
       return;
     }
     void decompressGzipBase64ToString(compressed).then((rawHtml) => {

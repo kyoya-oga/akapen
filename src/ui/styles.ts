@@ -100,6 +100,10 @@ export const OVERLAY_CSS = `
 .pcr-btn:hover {
   background: #334155;
 }
+.pcr-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .pcr-btn.is-active {
   background: #ca8a04;
   border-color: #eab308;
@@ -131,6 +135,22 @@ export const OVERLAY_CSS = `
 .pcr-status {
   font-size: 11px;
   color: #86efac;
+}
+.pcr-hint {
+  font-size: 11px;
+  color: #cbd5e1;
+}
+.pcr-quicklist-footer {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid #334155;
+  padding-top: 4px;
+}
+.pcr-btn-danger-text {
+  background: transparent;
+  border-color: transparent;
+  color: #fca5a5;
+  font-size: 11px;
 }
 .pcr-quicklist {
   margin-top: 4px;

@@ -1,14 +1,7 @@
 import { copyTextToClipboard } from "./codec";
 export { copyTextToClipboard };
 import type { ChangeRequestDoc } from "../core/types";
-import { uint8ArrayToBase64 } from "./codec";
 import type { ResourceEntry } from "./snapshot-io";
-
-export const encodeJsonToBase64 = (data: unknown): string => {
-  const jsonStr = JSON.stringify(data);
-  const bytes = new TextEncoder().encode(jsonStr);
-  return uint8ArrayToBase64(bytes);
-};
 
 export const escapeScriptContent = (jsonText: string): string => jsonText.replace(/</g, "\\u003c");
 
@@ -43,16 +36,19 @@ export type BuildReportHtmlParams = {
 export const buildReportHtmlString = (params: BuildReportHtmlParams): string => {
   const safeTitle = escapeHtmlText(params.pageTitle || "ページ");
   const jsonPayload = escapeScriptContent(JSON.stringify(params.doc));
-  const snapshotsBase64 = encodeJsonToBase64(params.snapshotBodies);
-  const resourcesBase64 = encodeJsonToBase64(params.resources);
+  // 中身は既に base64 文字列なので、さらに base64 化せず JSON のまま埋め込む（約 33% 小さくなる）
+  const snapshotsJson = escapeScriptContent(JSON.stringify(params.snapshotBodies));
+  const resourcesJson = escapeScriptContent(JSON.stringify(params.resources));
+  // 画像・CSS・フォントはすべて埋め込み済みなので、レポートを開いても外部へは一切通信させない
   const cspContent = [
     "default-src 'none'",
     "base-uri 'none'",
     "form-action 'none'",
     `script-src 'sha256-${params.viewerScriptSha256Base64}'`,
-    "style-src 'unsafe-inline' https:",
-    "img-src data: blob: https:",
-    "font-src data: blob: https:",
+    "style-src 'unsafe-inline'",
+    "img-src data: blob:",
+    "font-src data: blob:",
+    "media-src data: blob:",
     "frame-src blob:",
   ].join("; ");
 
@@ -67,8 +63,8 @@ export const buildReportHtmlString = (params: BuildReportHtmlParams): string => 
 <body>
   <div id="app"></div>
   <script type="application/json" id="pcr-data">${jsonPayload}</script>
-  <script type="application/octet-stream" id="pcr-snapshots">${snapshotsBase64}</script>
-  <script type="application/octet-stream" id="pcr-resources">${resourcesBase64}</script>
+  <script type="application/json" id="pcr-snapshots">${snapshotsJson}</script>
+  <script type="application/json" id="pcr-resources">${resourcesJson}</script>
   <script>${params.viewerScript}</script>
 </body>
 </html>`;

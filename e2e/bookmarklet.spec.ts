@@ -59,7 +59,7 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
       });
   });
 
-  test("「外枠へ広げる ↑」ボタンを押したとき、scriptやstyleの中身が混入せず、外側のセクション全体の削除やメモ指定に切り替わり、この要素を削除できる", async ({
+  test("「外枠へ広げる ↑」ボタンを押したとき、scriptやstyleの中身が混入せず、外側のセクション全体の削除やメモ指定に切り替わり、削除を依頼できる", async ({
     page,
   }) => {
     const html = readFileSync(FIXTURE_PATH, "utf-8");
@@ -87,7 +87,7 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
     await page.evaluate(() => {
       const sr = document.getElementById("pcr-bookmarklet-host")?.shadowRoot;
       const deleteBtn = Array.from(sr?.querySelectorAll("button") ?? []).find((b) =>
-        b.textContent?.includes("この要素を削除"),
+        b.textContent?.includes("削除を依頼"),
       );
       deleteBtn?.click();
     });
@@ -116,6 +116,12 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
     await page.route("https://shop.example.com/**", (route) => {
       if (route.request().url() === "https://shop.example.com/products/123") {
         return route.fulfill({ contentType: "text/html", body: html });
+      }
+      if (route.request().url() === "https://shop.example.com/styles/main.css") {
+        return route.fulfill({
+          contentType: "text/css",
+          body: ".pcr-e2e-external-rule { color: rgb(1, 2, 3); }",
+        });
       }
       return route.fulfill({ status: 404, body: "" });
     });
@@ -169,5 +175,81 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
     await expect(reportPage.locator(".v-title")).toHaveText("ページ変更依頼レポート");
     await expect(reportPage.locator(".v-card")).toHaveCount(1);
     await expect(reportPage.locator(".v-diff-ins")).toContainText("リニューアル後の");
+
+    // 外部 CSS はレポートに取り込まれ、開いたときに元サイトへ通信しない
+    const externalRequests: string[] = [];
+    reportPage.on("request", (req) => {
+      if (req.url().startsWith("http")) {
+        externalRequests.push(req.url());
+      }
+    });
+    const snapshotHtml = await reportPage
+      .frameLocator(".v-iframe")
+      .locator("html")
+      .evaluate((el) => el.outerHTML);
+    expect(snapshotHtml).toContain("pcr-e2e-external-rule");
+    expect(snapshotHtml).not.toContain("<link");
+    expect(externalRequests).toEqual([]);
+  });
+
+  test("エディタを開いたまま別の要素をクリックすると、その要素の編集に切り替わる（入力途中なら確認が出る）", async ({
+    page,
+  }) => {
+    await page.setContent(
+      '<html><body style="margin:0"><h1 id="title" style="margin:160px 0 0 400px">春の新商品</h1><button id="buy" style="position:absolute;left:400px;top:680px">カートに入れる</button></body></html>',
+    );
+    await page.evaluate(readFileSync(BUNDLE_PATH, "utf-8"));
+
+    const editorText = () =>
+      page.evaluate(
+        () =>
+          (
+            document
+              .getElementById("pcr-bookmarklet-host")
+              ?.shadowRoot?.querySelector(".pcr-textarea") as HTMLTextAreaElement | null
+          )?.value,
+      );
+
+    await page.click("#title");
+    expect(await editorText()).toBe("春の新商品");
+
+    await page.click("#buy");
+    expect(await editorText()).toBe("カートに入れる");
+
+    await page.evaluate(() => {
+      const sr = document.getElementById("pcr-bookmarklet-host")?.shadowRoot;
+      const textarea = sr?.querySelector(".pcr-textarea") as HTMLTextAreaElement | null;
+      if (textarea !== null && textarea !== undefined) {
+        textarea.value = "今すぐ購入";
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    });
+    const dialogMessages: string[] = [];
+    page.once("dialog", (dialog) => {
+      dialogMessages.push(dialog.message());
+      void dialog.dismiss();
+    });
+    await page.click("#title");
+    expect(dialogMessages).toHaveLength(1);
+    expect(await editorText()).toBe("今すぐ購入");
+  });
+
+  test("背景画像つきのボタンでも、文字があれば文言を編集できる", async ({ page }) => {
+    await page.setContent(
+      '<html><body><button id="b" style="margin:300px;background-image:url(data:image/gif;base64,R0lGODlhAQABAAAAACw=);padding:20px">詳しく見る</button></body></html>',
+    );
+    await page.evaluate(readFileSync(BUNDLE_PATH, "utf-8"));
+
+    await page.click("#b");
+
+    const editorValue = await page.evaluate(
+      () =>
+        (
+          document
+            .getElementById("pcr-bookmarklet-host")
+            ?.shadowRoot?.querySelector(".pcr-textarea") as HTMLTextAreaElement | null
+        )?.value,
+    );
+    expect(editorValue).toBe("詳しく見る");
   });
 });
