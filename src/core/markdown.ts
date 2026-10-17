@@ -152,8 +152,9 @@ const formatAiAnchorLines = (item: Item): readonly string[] => {
     ];
   }
   if (item.anchor.kind === "region") {
+    const { pageRect } = item.anchor;
     return [
-      `- 範囲の基準要素：${item.anchor.container.tagName}（セレクタの参考：${item.anchor.container.selector}）`,
+      `- 範囲の基準要素：${item.anchor.container.tagName}（セレクタの参考：${item.anchor.container.selector}、範囲：x=${pageRect.x}, y=${pageRect.y}, w=${pageRect.w}, h=${pageRect.h}）`,
     ];
   }
   return [];

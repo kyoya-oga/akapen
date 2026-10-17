@@ -366,7 +366,7 @@ const EditorPopover = ({
                 }
               }}
             >
-              指摘を取り消す
+              この変更を取り消す
             </button>
           )}
         </div>
@@ -397,7 +397,7 @@ const QuickListPopover = ({
   <div class="pcr-quicklist">
     {items.length === 0 ? (
       <div style={{ fontSize: "11px", color: "#94a3b8", padding: "4px" }}>
-        まだ指摘箇所がありません
+        まだ変更箇所がありません
       </div>
     ) : (
       items.map((item) => (
@@ -444,6 +444,19 @@ const ToolbarWarnings = ({ state }: { readonly state: AppState }): JSX.Element |
   );
 };
 
+const extractEditorHighlightRect = (editor: DraftEditorState | null): Rect | null => {
+  if (editor === null) {
+    return null;
+  }
+  if (editor.anchor.kind === "element") {
+    return editor.anchor.rect;
+  }
+  if (editor.anchor.kind === "region") {
+    return editor.anchor.pageRect;
+  }
+  return null;
+};
+
 const CanvasBoxes = ({
   state,
   scrollX,
@@ -454,54 +467,57 @@ const CanvasBoxes = ({
   readonly scrollX: number;
   readonly scrollY: number;
   readonly onBadgeClick: (seq: number) => void;
-}): JSX.Element => (
-  <div>
-    {state.hoveredRect !== null && !state.isPaused && !state.isAltPressed && (
-      <div class="pcr-hover-box" style={toViewportStyle(state.hoveredRect, scrollX, scrollY)} />
-    )}
+}): JSX.Element => {
+  const editorRect = extractEditorHighlightRect(state.editor);
+  return (
+    <div>
+      {state.hoveredRect !== null && !state.isPaused && !state.isAltPressed && (
+        <div class="pcr-hover-box" style={toViewportStyle(state.hoveredRect, scrollX, scrollY)} />
+      )}
 
-    {state.editor !== null && state.editor.anchor.kind === "element" && (
-      <div
-        class="pcr-hover-box"
-        style={{
-          ...toViewportStyle(state.editor.anchor.rect, scrollX, scrollY),
-          borderColor: "#16a34a",
-          background: "rgba(22, 163, 74, 0.10)",
-        }}
-      />
-    )}
-
-    {state.dragSelectionRect !== null && (
-      <div
-        class="pcr-drag-box"
-        style={toViewportStyle(state.dragSelectionRect, scrollX, scrollY)}
-      />
-    )}
-
-    {state.resolvedAnchors.map((resolved) => (
-      <div key={resolved.seq}>
+      {editorRect !== null && (
         <div
-          class={`pcr-anchor-box ${resolved.confidence === "fallback_rect" ? "is-fallback" : ""}`}
-          style={toViewportStyle(resolved.rect, scrollX, scrollY)}
-        />
-        <button
-          type="button"
-          class="pcr-badge"
+          class="pcr-hover-box"
           style={{
-            left: `${resolved.rect.x - scrollX - 10}px`,
-            top: `${resolved.rect.y - scrollY - 10}px`,
+            ...toViewportStyle(editorRect, scrollX, scrollY),
+            borderColor: "#16a34a",
+            background: "rgba(22, 163, 74, 0.10)",
           }}
-          title={
-            resolved.confidence === "selector_only" ? "文言が変わっています" : `#${resolved.seq}`
-          }
-          onClick={() => onBadgeClick(resolved.seq)}
-        >
-          {resolved.seq}
-        </button>
-      </div>
-    ))}
-  </div>
-);
+        />
+      )}
+
+      {state.dragSelectionRect !== null && (
+        <div
+          class="pcr-drag-box"
+          style={toViewportStyle(state.dragSelectionRect, scrollX, scrollY)}
+        />
+      )}
+
+      {state.resolvedAnchors.map((resolved) => (
+        <div key={resolved.seq}>
+          <div
+            class={`pcr-anchor-box ${resolved.confidence === "fallback_rect" ? "is-fallback" : ""}`}
+            style={toViewportStyle(resolved.rect, scrollX, scrollY)}
+          />
+          <button
+            type="button"
+            class="pcr-badge"
+            style={{
+              left: `${resolved.rect.x - scrollX - 10}px`,
+              top: `${resolved.rect.y - scrollY - 10}px`,
+            }}
+            title={
+              resolved.confidence === "selector_only" ? "文言が変わっています" : `#${resolved.seq}`
+            }
+            onClick={() => onBadgeClick(resolved.seq)}
+          >
+            {resolved.seq}
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+};
 
 export const OverlayApp = (props: OverlayAppProps): JSX.Element | null => {
   const { state, scrollX, scrollY, viewportW, viewportH, dispatch } = props;
@@ -527,6 +543,8 @@ export const OverlayApp = (props: OverlayAppProps): JSX.Element | null => {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };
+
+  const isTemporarilyPaused = state.isPaused || state.isAltPressed;
 
   return (
     <div>
@@ -565,14 +583,14 @@ export const OverlayApp = (props: OverlayAppProps): JSX.Element | null => {
             class="pcr-btn"
             onClick={() => dispatch({ type: "TOGGLE_QUICK_LIST" })}
           >
-            指摘 {state.items.length}件
+            変更 {state.items.length}件
           </button>
           <button
             type="button"
-            class={`pcr-btn ${state.isPaused || state.isAltPressed ? "is-active" : ""}`}
-            onClick={() => dispatch({ type: "SET_PAUSED", isPaused: !state.isPaused })}
+            class={`pcr-btn ${isTemporarilyPaused ? "is-active" : ""}`}
+            onClick={() => dispatch({ type: "SET_PAUSED", isPaused: !isTemporarilyPaused })}
           >
-            {state.isPaused || state.isAltPressed ? "再開" : "一時停止"}
+            {isTemporarilyPaused ? "再開" : "一時停止"}
           </button>
           <button type="button" class="pcr-btn" onClick={props.onOpenPageMeta}>
             ページ情報

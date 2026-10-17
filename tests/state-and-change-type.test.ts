@@ -175,8 +175,8 @@ describe("文言・リンク・画像・範囲・ページ情報の変更種別�
   });
 });
 
-describe("指摘項目の管理・削除・リセット時の振る舞い", () => {
-  test("途中の番号の指摘項目を削除しても、残った項目の番号は詰められず新しい項目には連番が振られる", () => {
+describe("変更項目の管理・削除・リセット時の振る舞い", () => {
+  test("途中の番号の変更項目を削除しても、残った項目の番号は詰められず新しい項目には連番が振られる", () => {
     const s0 = createInitialState("https://shop.example.com/products/123", false);
     const item1 = {
       seq: 1,
@@ -200,7 +200,7 @@ describe("指摘項目の管理・削除・リセット時の振る舞い", () =
     expect(s3.nextSeq).toBe(3);
   });
 
-  test("依頼者がリセットを実行したとき、すべての指摘項目が破棄され番号が1番に戻り画面復元の指示が出る", () => {
+  test("依頼者がリセットを実行したとき、すべての変更項目が破棄され番号が1番に戻り画面復元の指示が出る", () => {
     const s0 = createInitialState("https://shop.example.com/products/123", false);
     const item1 = {
       seq: 1,

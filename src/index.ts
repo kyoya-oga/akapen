@@ -83,6 +83,37 @@ const computeDragRect = (
   h: Math.round(Math.abs(endY - startY)),
 });
 
+export const filterReferencedReportAssets = (
+  doc: ChangeRequestDoc,
+  snapshotBodies: ReadonlyMap<string, string>,
+  resources: ReadonlyMap<string, ResourceEntry>,
+): {
+  readonly filteredDoc: ChangeRequestDoc;
+  readonly filteredSnapshotBodies: Readonly<Record<string, string>>;
+  readonly filteredResources: Readonly<Record<string, ResourceEntry>>;
+} => {
+  const referencedSnapshotIds = new Set(
+    doc.items.flatMap((i) => (i.snapshotId !== undefined ? [i.snapshotId] : [])),
+  );
+  const referencedAttachmentIds = new Set(doc.items.flatMap((i) => i.attachmentIds));
+  const filteredSnapshots = doc.snapshots.filter((s) => referencedSnapshotIds.has(s.id));
+  const filteredAttachments = doc.attachments.filter((a) => referencedAttachmentIds.has(a.id));
+  const filteredSnapshotBodies = Object.fromEntries(
+    Array.from(snapshotBodies.entries()).filter(([id]) => referencedSnapshotIds.has(id)),
+  );
+  const filteredResources = Object.fromEntries(resources);
+
+  return {
+    filteredDoc: {
+      ...doc,
+      snapshots: filteredSnapshots,
+      attachments: filteredAttachments,
+    },
+    filteredSnapshotBodies,
+    filteredResources,
+  };
+};
+
 type RuntimeContext = {
   state: AppState;
   readonly snapshotBodies: Map<string, string>;
@@ -191,9 +222,26 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
           isExcluded: shouldExcludeSnapshotForUrl(window.location.href),
         });
       }
-      const resolved = resolvePageAnchors(doc, ctx.state.items, ctx.state.currentUrl);
+      const resolved = resolvePageAnchors(
+        doc,
+
+        ctx.state.items,
+
+        ctx.state.currentUrl,
+        livePreview.getResolvedTarget,
+      );
       ctx.state = { ...ctx.state, resolvedAnchors: resolved };
       renderApp();
+    });
+  };
+
+  const openEditorForElementAndItem = (element: Element, existingItem?: Item): void => {
+    const ed = createEditorStateForElement(doc, element, livePreview.withCleanDom, existingItem);
+    const previewUrl =
+      ed.attachmentId !== undefined ? getAttachmentPreviewUrl(ed.attachmentId) : undefined;
+    dispatch({
+      type: "OPEN_EDITOR",
+      editor: previewUrl !== undefined ? { ...ed, attachmentPreviewUrl: previewUrl } : ed,
     });
   };
 
@@ -206,13 +254,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     if (!res.ok || res.value.element === null) {
       return;
     }
-    const ed = createEditorStateForElement(doc, res.value.element, livePreview.withCleanDom, item);
-    const previewUrl =
-      ed.attachmentId !== undefined ? getAttachmentPreviewUrl(ed.attachmentId) : undefined;
-    dispatch({
-      type: "OPEN_EDITOR",
-      editor: previewUrl !== undefined ? { ...ed, attachmentPreviewUrl: previewUrl } : ed,
-    });
+    openEditorForElementAndItem(res.value.element, item);
   };
 
   const handleBadgeClick = (seq: number): void => {
@@ -224,8 +266,24 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       dispatch({ type: "OPEN_EDITOR", editor: createEditorStateForPageMeta(doc, item) });
       return;
     }
+    if (item.anchor.kind === "region") {
+      const resolved = ctx.state.resolvedAnchors.find((a) => a.seq === item.seq);
+      const rect = resolved?.rect ?? item.anchor.pageRect;
+      const editor = createEditorStateForRegion(doc, rect, livePreview.withCleanDom, item);
+      dispatch({ type: "OPEN_EDITOR", editor });
+      return;
+    }
     openEditorForElementItem(item);
   };
+
+  const findExistingElementItemForTarget = (target: Element): Item | undefined =>
+    ctx.state.items.find((item) => {
+      if (item.url !== ctx.state.currentUrl || item.anchor.kind !== "element") {
+        return false;
+      }
+      const cached = livePreview.getResolvedTarget(item.seq);
+      return cached?.element === target;
+    });
 
   const executeCaptureSnapshotEffect = async (
     pendingItem: Item,
@@ -254,7 +312,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", item: pendingItem });
       dispatch({
         type: "OPERATION_FAILED",
-        message: "画面スナップショットの取得に失敗しました（指摘は保存済み）",
+        message: "画面スナップショットの取得に失敗しました（変更内容は保存済み）",
       });
     }
   };
@@ -269,7 +327,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
   };
 
   const exportReport = async (): Promise<void> => {
-    const exportDoc: ChangeRequestDoc = {
+    const rawDoc: ChangeRequestDoc = {
       schemaVersion: SCHEMA_VERSION,
       toolVersion: TOOL_VERSION,
       createdAt: new Date().toISOString(),
@@ -278,14 +336,19 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       items: ctx.state.items,
       attachments: ctx.state.attachments,
     };
-    const markdown = generateTicketMarkdown(exportDoc);
+    const { filteredDoc, filteredSnapshotBodies, filteredResources } = filterReferencedReportAssets(
+      rawDoc,
+      ctx.snapshotBodies,
+      ctx.resources,
+    );
+    const markdown = generateTicketMarkdown(filteredDoc);
     await copyTextToClipboard(markdown);
 
     const htmlReport = buildReportHtmlString({
       pageTitle: doc.title || "ページ",
-      doc: exportDoc,
-      snapshotBodies: Object.fromEntries(ctx.snapshotBodies),
-      resources: Object.fromEntries(ctx.resources),
+      doc: filteredDoc,
+      snapshotBodies: filteredSnapshotBodies,
+      resources: filteredResources,
       viewerScript: EMBEDDED_VIEWER_SCRIPT,
       viewerScriptSha256Base64: EMBEDDED_VIEWER_SHA256_BASE64,
       viewerStyles: VIEWER_CSS,
@@ -298,13 +361,25 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     });
   };
 
+  const findScrollElementForItem = (item: Item): Element | null => {
+    if (item.anchor.kind !== "element") {
+      return null;
+    }
+    const cached = livePreview.getResolvedTarget(item.seq);
+    if (cached !== undefined) {
+      return cached.element;
+    }
+    const res = resolveElementLocator(doc, item.anchor.locator, item.after);
+    return res.ok ? res.value.element : null;
+  };
+
   const scrollToTargetItem = (item: Item): void => {
+    const el = findScrollElementForItem(item);
+    if (el !== null) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
     if (item.anchor.kind === "element") {
-      const res = resolveElementLocator(doc, item.anchor.locator);
-      if (res.ok && res.value.element !== null) {
-        res.value.element.scrollIntoView({ behavior: "smooth", block: "center" });
-        return;
-      }
       window.scrollTo({ top: Math.max(0, item.anchor.rect.y - 120), behavior: "smooth" });
     } else if (item.anchor.kind === "region") {
       window.scrollTo({ top: Math.max(0, item.anchor.pageRect.y - 120), behavior: "smooth" });
@@ -343,6 +418,17 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     }
   };
 
+  const hydrateCompletedDraftFromDb = async (): Promise<void> => {
+    const draft = await promoteCompletedDraftToActiveInDb();
+    if (draft === null) {
+      return;
+    }
+    const bundle = await loadInitialStorageBundle();
+    Object.entries(bundle.snapshotBodies).map(([id, b64]) => ctx.snapshotBodies.set(id, b64));
+    Object.entries(bundle.resources).map(([hKey, r]) => ctx.resources.set(hKey, r));
+    dispatch({ type: "HYDRATE_DRAFT", draft, hasCompletedDraft: false });
+  };
+
   const runEffect = (effect: Effect): void => {
     switch (effect.type) {
       case "SYNC_LIVE_DOM":
@@ -362,11 +448,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
         void clearAllDraftDataInDb();
         break;
       case "LOAD_COMPLETED_DRAFT_FROM_DB":
-        void promoteCompletedDraftToActiveInDb().then((draft) => {
-          if (draft !== null) {
-            dispatch({ type: "HYDRATE_DRAFT", draft, hasCompletedDraft: false });
-          }
-        });
+        void hydrateCompletedDraftFromDb();
         break;
       case "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM":
         void executeCaptureSnapshotEffect(effect.pendingItem, effect.skipSnapshot);
@@ -415,7 +497,14 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     dispatch({ type: "UPDATE_HOVER_RECT", rect: getElementPageRect(doc, target) });
   };
 
+  const syncAltKeyFromEvent = (altKey: boolean): void => {
+    if (ctx.state.isAltPressed && !altKey) {
+      dispatch({ type: "SET_ALT_PRESSED", isAltPressed: false });
+    }
+  };
+
   const onPointerMove = (e: PointerEvent): void => {
+    syncAltKeyFromEvent(e.altKey);
     if (isEventInsideHost(e, host) || !isPointingActive()) {
       return;
     }
@@ -450,6 +539,15 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     ctx.pointerDownPos = { x: e.clientX, y: e.clientY };
   };
 
+  const openEditorAtPoint = (clientX: number, clientY: number): void => {
+    const target = doc.elementFromPoint(clientX, clientY);
+    if (target === null || target === doc.documentElement || target === doc.body) {
+      return;
+    }
+    const existingItem = findExistingElementItemForTarget(target);
+    openEditorForElementAndItem(target, existingItem);
+  };
+
   const onPointerUp = (e: PointerEvent): void => {
     if (isEventInsideHost(e, host) || ctx.pointerDownPos === null) {
       return;
@@ -474,11 +572,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       return;
     }
 
-    const target = doc.elementFromPoint(e.clientX, e.clientY);
-    if (target !== null && target !== doc.documentElement && target !== doc.body) {
-      const editor = createEditorStateForElement(doc, target, livePreview.withCleanDom);
-      dispatch({ type: "OPEN_EDITOR", editor });
-    }
+    openEditorAtPoint(e.clientX, e.clientY);
   };
 
   const onClickCapture = (e: MouseEvent): void => {
@@ -526,12 +620,20 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     }
   };
 
+  const onWindowBlur = (): void => {
+    ctx.pointerDownPos = null;
+    if (ctx.state.isAltPressed) {
+      dispatch({ type: "SET_ALT_PRESSED", isAltPressed: false });
+    }
+  };
+
   window.addEventListener("pointermove", onPointerMove, true);
   window.addEventListener("pointerdown", onPointerDown, true);
   window.addEventListener("pointerup", onPointerUp, true);
   window.addEventListener("click", onClickCapture, true);
   window.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("keyup", onKeyUp, true);
+  window.addEventListener("blur", onWindowBlur);
   window.addEventListener("scroll", scheduleAnchorRefresh, { passive: true, capture: true });
   window.addEventListener("resize", scheduleAnchorRefresh, { passive: true });
   window.addEventListener("popstate", scheduleAnchorRefresh);
@@ -550,9 +652,9 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
   });
 
   void loadInitialStorageBundle().then((bundle) => {
-    Object.entries(bundle.snapshotBodies).map(([id, b64]) => ctx.snapshotBodies.set(id, b64));
-    Object.entries(bundle.resources).map(([hKey, r]) => ctx.resources.set(hKey, r));
     if (bundle.activeDraft !== null) {
+      Object.entries(bundle.snapshotBodies).map(([id, b64]) => ctx.snapshotBodies.set(id, b64));
+      Object.entries(bundle.resources).map(([hKey, r]) => ctx.resources.set(hKey, r));
       dispatch({
         type: "HYDRATE_DRAFT",
         draft: bundle.activeDraft,
@@ -590,6 +692,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     window.removeEventListener("click", onClickCapture, true);
     window.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("keyup", onKeyUp, true);
+    window.removeEventListener("blur", onWindowBlur);
     window.removeEventListener("scroll", scheduleAnchorRefresh, true);
     window.removeEventListener("resize", scheduleAnchorRefresh);
     window.removeEventListener("popstate", scheduleAnchorRefresh);

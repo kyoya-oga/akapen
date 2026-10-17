@@ -56,16 +56,18 @@ const collectTextNodes = (root: Node, doc: Document): readonly Node[] =>
     (node) => node.nodeType === TEXT_NODE && !isInsideNonTextElement(node),
   );
 
-export const extractCleanElementText = (doc: Document, element: Element): string => {
+export const extractFullElementText = (doc: Document, element: Element): string => {
   const nodes = collectTextNodes(element, doc);
   const raw = nodes.map((n) => n.textContent ?? "").join("");
   return raw
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 0)
-    .join("\n")
-    .slice(0, MAX_EXACT_LENGTH);
+    .join("\n");
 };
+
+export const extractCleanElementText = (doc: Document, element: Element): string =>
+  extractFullElementText(doc, element).slice(0, MAX_EXACT_LENGTH);
 
 const collectTextSegments = (root: Node, doc: Document): readonly TextSegment[] => {
   const nonEmpty = collectTextNodes(root, doc).filter(
@@ -232,6 +234,21 @@ const findOccurrences = (text: string, needle: string): readonly number[] => {
   );
 };
 
+const scoreElementContextInSegments = (
+  el: Element,
+  segments: readonly TextSegment[],
+  fullText: string,
+  quote: TextQuote,
+): number => {
+  const targetSegments = segments.filter((s) => el.contains(s.node));
+  const firstSeg = targetSegments[0];
+  const lastSeg = targetSegments[targetSegments.length - 1];
+  if (firstSeg === undefined || lastSeg === undefined) {
+    return 0;
+  }
+  return scoreContextMatch(fullText, firstSeg.start, lastSeg.end, quote);
+};
+
 const searchByTextQuote = (doc: Document, locator: ElementLocator): Element | null => {
   const root = doc.body ?? doc.documentElement;
   const normExact = normalizeWhitespace(locator.textQuote.exact);
@@ -254,26 +271,61 @@ const searchByTextQuote = (doc: Document, locator: ElementLocator): Element | nu
     return best.element;
   }
 
-  // Whitespace-normalized fallback scan across elements
+  // Whitespace-normalized fallback scan across elements (with context scoring)
   const allElements = Array.from(root.querySelectorAll(locator.tagName || "*"));
   const matchingElements = allElements.filter(
-    (el) => normalizeWhitespace(el.textContent ?? "") === normExact,
+    (el) =>
+      normalizeWhitespace(extractCleanElementText(doc, el)) === normExact ||
+      normalizeWhitespace(el.textContent ?? "") === normExact,
   );
-  return matchingElements[0] ?? null;
+  if (matchingElements.length === 0) {
+    return null;
+  }
+  const scoredElements = matchingElements.map((element) => ({
+    element,
+    score: scoreElementContextInSegments(element, segments, fullText, locator.textQuote),
+  }));
+  return scoredElements.reduce((a, b) => (b.score > a.score ? b : a)).element;
+};
+
+const doesElementMatchText = (doc: Document, element: Element, expectedText: string): boolean => {
+  const normExpected = normalizeWhitespace(expectedText.slice(0, MAX_EXACT_LENGTH));
+  if (normExpected.length === 0) {
+    return true;
+  }
+  const normClean = normalizeWhitespace(extractCleanElementText(doc, element));
+  const normRaw = normalizeWhitespace(element.textContent ?? "");
+  return normClean === normExpected || normRaw === normalizeWhitespace(expectedText);
 };
 
 export const resolveElementLocator = (
   doc: Document,
   locator: ElementLocator,
+  expectedAfterText?: string,
 ): Result<ResolvedElementResult, string> => {
   const bySelector = safeQuerySelector(doc, locator.selector);
-  const normTarget = normalizeWhitespace(locator.textQuote.exact);
 
   if (bySelector !== null) {
-    const normActual = normalizeWhitespace(bySelector.textContent ?? "");
-    if (normTarget.length === 0 || normActual === normTarget) {
+    const matchesBefore = doesElementMatchText(doc, bySelector, locator.textQuote.exact);
+    const matchesAfter =
+      expectedAfterText !== undefined && doesElementMatchText(doc, bySelector, expectedAfterText);
+    if (matchesBefore || matchesAfter) {
       return ok({ element: bySelector, confidence: "exact_selector" });
     }
+  }
+
+  const byAfterQuote =
+    expectedAfterText !== undefined && expectedAfterText.trim().length > 0
+      ? searchByTextQuote(doc, {
+          ...locator,
+          textQuote: {
+            ...locator.textQuote,
+            exact: expectedAfterText.slice(0, MAX_EXACT_LENGTH),
+          },
+        })
+      : null;
+  if (byAfterQuote !== null) {
+    return ok({ element: byAfterQuote, confidence: "text_quote" });
   }
 
   const byQuote = searchByTextQuote(doc, locator);

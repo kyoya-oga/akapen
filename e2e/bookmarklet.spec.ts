@@ -54,7 +54,7 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
       .toEqual({
         h1Text: "変更後の新しい見出しタイトル",
         badgeCount: 1,
-        barText: expect.stringContaining("指摘 1件"),
+        barText: expect.stringContaining("変更 1件"),
         popoverOpen: false,
       });
   });
@@ -109,7 +109,7 @@ test.describe("赤ペン（ブックマークレット）の実ブラウザ動�
       });
   });
 
-  test("指摘を確定したあと「完了」ボタンを押すと、HTMLレポートがダウンロードされ、そのレポートをブラウザで開くとスナップショットと変更差分が表示される", async ({
+  test("変更内容を確定したあと「完了」ボタンを押すと、HTMLレポートがダウンロードされ、そのレポートをブラウザで開くとスナップショットと変更差分が表示される", async ({
     page,
   }) => {
     const html = readFileSync(FIXTURE_PATH, "utf-8");

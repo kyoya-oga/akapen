@@ -6,7 +6,7 @@ import {
   generateTicketMarkdown,
 } from "../core/markdown";
 import { type PreviewMode, applyPreviewToClonedDocument, computeCharDiff } from "../core/preview";
-import type { ChangeRequestDoc, Item } from "../core/types";
+import type { ChangeRequestDoc, Item, Rect } from "../core/types";
 import {
   base64ToUint8Array,
   copyTextToClipboard,
@@ -37,27 +37,93 @@ const replacePcrResWithBlobUrls = (
 ): string =>
   html.replace(/pcr-res:([a-f0-9]+)/g, (full, hash: string) => blobUrlsByHash[hash] ?? full);
 
+const computeIframeRegionRect = (
+  iframeDoc: Document,
+  item: Item & { readonly anchor: Extract<Item["anchor"], { readonly kind: "region" }> },
+): Rect => {
+  const container = resolveDomPath(iframeDoc.documentElement, item.anchor.container.domPath);
+  if (container !== null) {
+    const r = container.getBoundingClientRect();
+    const scrollX = iframeDoc.defaultView?.scrollX ?? 0;
+    const scrollY = iframeDoc.defaultView?.scrollY ?? 0;
+    if (r.width > 0 && r.height > 0) {
+      return {
+        x: Math.round(r.left + scrollX + r.width * item.anchor.ratio.x),
+        y: Math.round(r.top + scrollY + r.height * item.anchor.ratio.y),
+        w: Math.round(r.width * item.anchor.ratio.w),
+        h: Math.round(r.height * item.anchor.ratio.h),
+      };
+    }
+  }
+  return item.anchor.pageRect;
+};
+
+const ensureRegionOverlayElement = (
+  iframeDoc: Document,
+  item: Item & { readonly anchor: Extract<Item["anchor"], { readonly kind: "region" }> },
+): Element | null => {
+  if (iframeDoc.body === null) {
+    return null;
+  }
+  const existing = iframeDoc.querySelector(`[data-pcr-region-seq="${item.seq}"]`);
+  const box = existing ?? iframeDoc.createElement("div");
+  const rect = computeIframeRegionRect(iframeDoc, item);
+  box.setAttribute("data-pcr-region-seq", String(item.seq));
+  box.setAttribute(
+    "style",
+    `position:absolute;left:${rect.x}px;top:${rect.y}px;width:${Math.max(4, rect.w)}px;height:${Math.max(4, rect.h)}px;border:2px dashed #ea580c;background:rgba(234,88,12,0.12);pointer-events:none;z-index:2147483640;`,
+  );
+  if (existing === null) {
+    iframeDoc.body.appendChild(box);
+  }
+  return box;
+};
+
 const resolveItemTargetInIframe = (iframeDoc: Document, item: Item): Element | null => {
   if (item.anchor.kind === "element") {
     return resolveDomPath(iframeDoc.documentElement, item.anchor.locator.domPath);
   }
   if (item.anchor.kind === "region") {
-    return resolveDomPath(iframeDoc.documentElement, item.anchor.container.domPath);
+    return ensureRegionOverlayElement(
+      iframeDoc,
+      item as Item & { readonly anchor: Extract<Item["anchor"], { readonly kind: "region" }> },
+    );
   }
   return null;
 };
 
-const applyHighlightToTarget = (target: Element, seq: number, isSelected: boolean): void => {
-  const prevStyle = target.getAttribute("style") ?? "";
-  const sep = prevStyle.length > 0 && !prevStyle.trim().endsWith(";") ? ";" : "";
-  const borderColor = isSelected ? "#2563eb" : "#dc2626";
-  target.setAttribute(
-    "style",
-    `${prevStyle}${sep}outline:2px solid ${borderColor} !important;outline-offset:2px !important;`,
-  );
-  target.setAttribute("data-pcr-seq", String(seq));
+const ensureIframeHighlightStyle = (iframeDoc: Document, mode: PreviewMode): void => {
+  const styleId = "pcr-viewer-highlight-style";
+  const existing = iframeDoc.getElementById(styleId);
+  const styleEl = existing ?? iframeDoc.createElement("style");
+  styleEl.id = styleId;
+  const baseRule =
+    mode === "before"
+      ? "[data-pcr-seq] { outline: 2px solid #dc2626 !important; outline-offset: 2px !important; }"
+      : "";
+  styleEl.textContent = [
+    baseRule,
+    '[data-pcr-selected="true"] { box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.5) !important; }',
+  ].join("\n");
+  if (existing === null) {
+    (iframeDoc.head ?? iframeDoc.documentElement).appendChild(styleEl);
+  }
+};
+
+const applyHighlightToTarget = (
+  target: Element,
+  item: Item,
+  isSelected: boolean,
+  mode: PreviewMode,
+): void => {
+  target.setAttribute("data-pcr-seq", String(item.seq));
   if (isSelected) {
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.setAttribute("data-pcr-selected", "true");
+    const scrollTarget =
+      mode === "after" && item.changeType === "DELETE" ? (target.parentElement ?? target) : target;
+    scrollTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+  } else {
+    target.removeAttribute("data-pcr-selected");
   }
 };
 
@@ -65,11 +131,13 @@ const decorateIframeBadges = (
   iframeDoc: Document,
   snapshotItems: readonly Item[],
   selectedSeq: number | null,
+  mode: PreviewMode,
 ): void => {
+  ensureIframeHighlightStyle(iframeDoc, mode);
   snapshotItems.map((item) => {
     const target = resolveItemTargetInIframe(iframeDoc, item);
     if (target !== null) {
-      applyHighlightToTarget(target, item.seq, item.seq === selectedSeq);
+      applyHighlightToTarget(target, item, item.seq === selectedSeq, mode);
     }
   });
 };
@@ -275,7 +343,7 @@ export const mountViewerFromDom = (): void => {
     const snapId = getActiveSnapshotId();
     if (iframeDoc !== null && snapId !== undefined) {
       const sameSnapItems = doc.items.filter((i) => i.snapshotId === snapId);
-      decorateIframeBadges(iframeDoc, sameSnapItems, state.selectedSeq);
+      decorateIframeBadges(iframeDoc, sameSnapItems, state.selectedSeq, state.mode);
     }
   });
 
@@ -385,7 +453,12 @@ export const mountViewerFromDom = (): void => {
                 refreshIframeContent();
               } else if (iframe.contentDocument !== null && item.snapshotId !== undefined) {
                 const sameSnap = doc.items.filter((i) => i.snapshotId === item.snapshotId);
-                decorateIframeBadges(iframe.contentDocument, sameSnap, state.selectedSeq);
+                decorateIframeBadges(
+                  iframe.contentDocument,
+                  sameSnap,
+                  state.selectedSeq,
+                  state.mode,
+                );
               }
             },
             resolveAttachmentUrl,

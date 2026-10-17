@@ -162,7 +162,7 @@ const shouldReplaceWithEmptyTemplate = (el: Element): boolean => {
 const replaceWithPlaceholder = (doc: Document, el: Element): void => {
   const tag = el.tagName.toLowerCase();
   if (tag === "iframe") {
-    const placeholder = doc.createElement("div");
+    const placeholder = doc.createElement("span");
     const width = el.getAttribute("width") ?? "100%";
     const height = el.getAttribute("height") ?? "150px";
     placeholder.setAttribute("data-pcr-iframe-placeholder", "true");

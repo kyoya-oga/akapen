@@ -23,6 +23,7 @@ import type { AttachmentMeta, SnapshotMeta } from "../core/types";
 export const MAX_SINGLE_RESOURCE_BYTES = 2 * 1024 * 1024;
 export const MAX_TOTAL_RESOURCE_BYTES = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_DIMENSION = 2000;
+const FETCH_TIMEOUT_MS = 4000;
 
 export type ResourceEntry = {
   readonly hash: string;
@@ -98,9 +99,17 @@ const extractDynamicStyles = (doc: Document, baseUrl: string): string => {
   return rewriteCssUrlsToAbsolute(combined, baseUrl);
 };
 
+const urlResourceCache = new Map<string, ResourceEntry>();
+
 const fetchSingleImageResource = async (url: string): Promise<Result<ResourceEntry, string>> => {
+  const cached = urlResourceCache.get(url);
+  if (cached !== undefined) {
+    return ok(cached);
+  }
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const resp = await fetch(url, { credentials: "same-origin" });
+    const resp = await fetch(url, { credentials: "same-origin", signal: controller.signal });
     if (!resp.ok) {
       return err(`HTTP ${resp.status}`);
     }
@@ -115,14 +124,18 @@ const fetchSingleImageResource = async (url: string): Promise<Result<ResourceEnt
     }
     const bytes = new Uint8Array(buffer);
     const hash = await computeSha256Hex(bytes);
-    return ok({
+    const entry: ResourceEntry = {
       hash,
       mime: contentType,
       base64: uint8ArrayToBase64(bytes),
       byteLength: buffer.byteLength,
-    });
+    };
+    urlResourceCache.set(url, entry);
+    return ok(entry);
   } catch {
     return err("Fetch error");
+  } finally {
+    clearTimeout(timerId);
   }
 };
 
@@ -166,8 +179,9 @@ const fetchResourcesWithinBudget = async (
   readonly urlToHash: Readonly<Record<string, string>>;
   readonly newResources: readonly ResourceEntry[];
 }> => {
+  const uniqueUrls = Array.from(new Set(urls));
   const results = await Promise.all(
-    urls.map(async (url) => ({ url, res: await fetchSingleImageResource(url) })),
+    uniqueUrls.map(async (url) => ({ url, res: await fetchSingleImageResource(url) })),
   );
   const validFetched = results.flatMap(({ url, res }) =>
     res.ok ? [{ url, entry: res.value }] : [],

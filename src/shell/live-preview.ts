@@ -1,5 +1,5 @@
 import { findClosestLink, resolveElementLocator } from "../core/anchor";
-import type { Item } from "../core/types";
+import type { AnchorMatchConfidence, Item } from "../core/types";
 import { isSafeNavigationUrl } from "../core/url-safety";
 
 export type OriginalElementSnapshot = {
@@ -13,6 +13,11 @@ export type OriginalElementSnapshot = {
   readonly styleAttr: string | null;
 };
 
+export type ResolvedLiveTarget = {
+  readonly element: Element;
+  readonly confidence: AnchorMatchConfidence;
+};
+
 export type LivePreviewController = {
   readonly syncItems: (
     doc: Document,
@@ -22,6 +27,7 @@ export type LivePreviewController = {
   ) => void;
   readonly restoreAll: () => void;
   readonly withCleanDom: <T>(fn: () => T) => T;
+  readonly getResolvedTarget: (seq: number) => ResolvedLiveTarget | undefined;
 };
 
 const captureOriginalElement = (element: Element): OriginalElementSnapshot => {
@@ -29,7 +35,7 @@ const captureOriginalElement = (element: Element): OriginalElementSnapshot => {
   return {
     element,
     textContent: element.textContent,
-    childNodes: Array.from(element.childNodes).map((n) => n.cloneNode(true)),
+    childNodes: Array.from(element.childNodes),
     href: linkElement?.getAttribute("href") ?? null,
     linkElement,
     src: element.getAttribute("src"),
@@ -46,11 +52,16 @@ const setOrRemoveAttr = (el: Element, attr: string, val: string | null): void =>
   }
 };
 
-const restoreOriginalElement = (orig: OriginalElementSnapshot): void => {
-  while (orig.element.firstChild !== null) {
-    orig.element.removeChild(orig.element.firstChild);
+const restoreOriginalElement = (
+  orig: OriginalElementSnapshot,
+  wasChildrenReplaced: boolean,
+): void => {
+  if (wasChildrenReplaced) {
+    while (orig.element.firstChild !== null) {
+      orig.element.removeChild(orig.element.firstChild);
+    }
+    orig.childNodes.map((n) => orig.element.appendChild(n));
   }
-  orig.childNodes.map((n) => orig.element.appendChild(n.cloneNode(true)));
   if (orig.linkElement !== null) {
     setOrRemoveAttr(orig.linkElement, "href", orig.href);
   }
@@ -78,8 +89,10 @@ const applySingleLiveChange = (
   element: Element,
   item: Item,
   getAttachmentPreviewUrl: (id: string) => string | undefined,
+  childrenReplacedElements: Set<Element>,
 ): void => {
   if (item.after !== undefined) {
+    childrenReplacedElements.add(element);
     element.textContent = item.after;
   }
   if (item.hrefAfter !== undefined && isSafeNavigationUrl(item.hrefAfter)) {
@@ -100,6 +113,8 @@ const applySingleLiveChange = (
 
 export const createLivePreviewController = (): LivePreviewController => {
   const originals = new Map<Element, OriginalElementSnapshot>();
+  const childrenReplacedElements = new Set<Element>();
+  const resolvedBySeq = new Map<number, ResolvedLiveTarget>();
   const lastArgsRef: {
     doc: Document | null;
     items: readonly Item[];
@@ -113,8 +128,12 @@ export const createLivePreviewController = (): LivePreviewController => {
   };
 
   const restoreAll = (): void => {
-    Array.from(originals.values()).reverse().map(restoreOriginalElement);
+    Array.from(originals.values())
+      .reverse()
+      .map((orig) => restoreOriginalElement(orig, childrenReplacedElements.has(orig.element)));
     originals.clear();
+    childrenReplacedElements.clear();
+    resolvedBySeq.clear();
   };
 
   const syncItems = (
@@ -131,19 +150,25 @@ export const createLivePreviewController = (): LivePreviewController => {
     restoreAll();
 
     const pageItems = items.filter((item) => item.url === currentUrl);
-    pageItems.map((item) => {
+    const resolvedEntries = pageItems.flatMap((item) => {
       if (item.anchor.kind !== "element") {
-        return;
+        return [];
       }
       const resolved = resolveElementLocator(doc, item.anchor.locator);
       if (!resolved.ok || resolved.value.element === null) {
-        return;
+        return [];
       }
-      const target = resolved.value.element;
-      if (!originals.has(target)) {
-        originals.set(target, captureOriginalElement(target));
+      return [
+        { item, element: resolved.value.element, confidence: resolved.value.confidence } as const,
+      ];
+    });
+
+    resolvedEntries.map(({ item, element, confidence }) => {
+      resolvedBySeq.set(item.seq, { element, confidence });
+      if (!originals.has(element)) {
+        originals.set(element, captureOriginalElement(element));
       }
-      applySingleLiveChange(target, item, getAttachmentPreviewUrl);
+      applySingleLiveChange(element, item, getAttachmentPreviewUrl, childrenReplacedElements);
     });
   };
 
@@ -163,9 +188,18 @@ export const createLivePreviewController = (): LivePreviewController => {
     }
   };
 
+  const getResolvedTarget = (seq: number): ResolvedLiveTarget | undefined => {
+    const entry = resolvedBySeq.get(seq);
+    if (entry?.element.isConnected) {
+      return entry;
+    }
+    return undefined;
+  };
+
   return {
     syncItems,
     restoreAll,
     withCleanDom,
+    getResolvedTarget,
   };
 };

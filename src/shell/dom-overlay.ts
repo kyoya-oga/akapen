@@ -1,7 +1,7 @@
 import {
   captureElementLocator,
   computeSmallestContainingElement,
-  extractCleanElementText,
+  extractFullElementText,
   extractImageSrc,
   findClosestLink,
   hasFormattingChildren,
@@ -18,6 +18,7 @@ import type {
   ResolvedAnchor,
   TargetKind,
 } from "../core/types";
+import type { ResolvedLiveTarget } from "./live-preview";
 
 export const getElementPageRect = (doc: Document, el: Element): Rect => {
   const r = el.getBoundingClientRect();
@@ -103,10 +104,13 @@ export const createEditorStateForElement = (
   existingItem?: Item,
 ): DraftEditorState =>
   withCleanDom(() => {
-    const locator = captureElementLocator(doc, element);
+    const locator =
+      existingItem?.anchor.kind === "element"
+        ? existingItem.anchor.locator
+        : captureElementLocator(doc, element);
     const rect = getElementPageRect(doc, element);
     const targetKind = detectTargetKind(doc, element);
-    const rawText = extractCleanElementText(doc, element);
+    const rawText = extractFullElementText(doc, element);
     const initialText = existingItem?.before ?? rawText;
     const currentText = existingItem?.after ?? initialText;
     const linkEl = findClosestLink(element);
@@ -132,8 +136,24 @@ export const createEditorStateForRegion = (
   doc: Document,
   pageRect: Rect,
   withCleanDom: <T>(fn: () => T) => T,
+  existingItem?: Item,
 ): DraftEditorState =>
   withCleanDom(() => {
+    if (existingItem !== undefined && existingItem.anchor.kind === "region") {
+      return {
+        editingSeq: existingItem.seq,
+        targetKind: "region",
+        anchor: existingItem.anchor,
+        expansionHistory: [],
+        initialText: "",
+        currentText: "",
+        memo: existingItem.memo ?? "",
+        isDeleteRequested: false,
+        hasChildFormatting: false,
+        popoverRect: pageRect,
+      };
+    }
+
     const containerEl = computeSmallestContainingElement(doc, pageRect, (el) =>
       getElementPageRect(doc, el),
     );
@@ -208,12 +228,24 @@ export const createEditorStateForPageMeta = (
   };
 };
 
-const resolveSingleItemAnchor = (doc: Document, item: Item): ResolvedAnchor | null => {
+const resolveSingleItemAnchor = (
+  doc: Document,
+  item: Item,
+  getResolvedTarget?: (seq: number) => ResolvedLiveTarget | undefined,
+): ResolvedAnchor | null => {
   if (item.anchor.kind === "pageMeta") {
     return null;
   }
   if (item.anchor.kind === "element") {
-    const res = resolveElementLocator(doc, item.anchor.locator);
+    const cached = getResolvedTarget?.(item.seq);
+    if (cached !== undefined) {
+      return {
+        seq: item.seq,
+        rect: getElementPageRect(doc, cached.element),
+        confidence: cached.confidence,
+      };
+    }
+    const res = resolveElementLocator(doc, item.anchor.locator, item.after);
     if (res.ok && res.value.element !== null) {
       return {
         seq: item.seq,
@@ -252,11 +284,12 @@ export const resolvePageAnchors = (
   doc: Document,
   items: readonly Item[],
   currentUrl: string,
+  getResolvedTarget?: (seq: number) => ResolvedLiveTarget | undefined,
 ): readonly ResolvedAnchor[] =>
   items
     .filter((i) => i.url === currentUrl)
     .flatMap((item) => {
-      const resolved = resolveSingleItemAnchor(doc, item);
+      const resolved = resolveSingleItemAnchor(doc, item, getResolvedTarget);
       return resolved !== null ? [resolved] : [];
     });
 
@@ -353,7 +386,7 @@ export const expandCurrentEditorLocator = (
       locator: captureElementLocator(doc, nextEl),
       rect: getElementPageRect(doc, nextEl),
       expansionHistory: [...editor.expansionHistory, currentLocator],
-      initialText: extractCleanElementText(doc, nextEl),
+      initialText: extractFullElementText(doc, nextEl),
       hasChildFormatting: hasFormattingChildren(nextEl),
     };
   });
@@ -382,11 +415,12 @@ export const shrinkCurrentEditorLocator = (
     const resolved = resolveElementLocator(doc, prevLocator);
     const el = resolved.ok ? resolved.value.element : null;
     const rect = el !== null ? getElementPageRect(doc, el) : fallbackRect;
+    const initialText = el !== null ? extractFullElementText(doc, el) : prevLocator.textQuote.exact;
     return {
       locator: prevLocator,
       rect,
       expansionHistory: editor.expansionHistory.slice(0, -1),
-      initialText: prevLocator.textQuote.exact,
+      initialText,
       hasChildFormatting: el !== null ? hasFormattingChildren(el) : false,
     };
   });

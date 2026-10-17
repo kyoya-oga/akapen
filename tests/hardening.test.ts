@@ -1,13 +1,25 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { buildTextQuote } from "../src/core/anchor";
+import {
+  buildTextQuote,
+  captureElementLocator,
+  resolveDomPath,
+  resolveElementLocator,
+} from "../src/core/anchor";
 import { isConfirmEnter } from "../src/core/keyboard";
 import { applyPreviewToClonedDocument, computeCharDiff } from "../src/core/preview";
 import { sanitizeClonedDocument } from "../src/core/sanitize";
 import { UNSAFE_HREF_MESSAGE, createInitialState, update } from "../src/core/state";
-import type { DraftEditorState, ElementLocator, Item } from "../src/core/types";
+import type { ChangeRequestDoc, DraftEditorState, ElementLocator, Item } from "../src/core/types";
 import { isDangerousUrl, isSafeNavigationUrl } from "../src/core/url-safety";
-import { mountShadowHost } from "../src/shell/dom-overlay";
+import { filterReferencedReportAssets } from "../src/index";
+import {
+  createEditorStateForElement,
+  createEditorStateForRegion,
+  mountShadowHost,
+  resolvePageAnchors,
+} from "../src/shell/dom-overlay";
 import { buildReportHtmlString, escapeScriptContent } from "../src/shell/export-io";
+import { createLivePreviewController } from "../src/shell/live-preview";
 import { saveDraftAndAssetsToDb } from "../src/shell/storage-idb";
 import { createTestDocument } from "./helpers";
 
@@ -197,6 +209,21 @@ describe("スナップショットの無害化（追加分）", () => {
 
     expect(doc.getElementById("t")?.getAttribute("href")).toBe("#");
   });
+
+  test("<p> 内の <iframe> を無害化して HTML 再パースしても、<p> が分割されず後続要素の domPath がずれない", () => {
+    const doc = createTestDocument(
+      '<html><body><div><p><iframe src="https://example.com"></iframe></p><p id="target">対象テキスト</p></div></body></html>',
+    );
+    const target = doc.getElementById("target") as Element;
+    const locator = captureElementLocator(doc, target);
+
+    sanitizeClonedDocument(doc, "https://shop.example.com/");
+    const reparsed = createTestDocument(`<!doctype html>\n${doc.documentElement.outerHTML}`);
+
+    expect(resolveDomPath(reparsed.documentElement, locator.domPath)?.textContent).toBe(
+      "対象テキスト",
+    );
+  });
 });
 
 describe("書き出す HTML レポートの安全性", () => {
@@ -267,6 +294,215 @@ describe("テキスト引用位置の算出", () => {
     const quote = buildTextQuote(doc, doc.getElementById("t") as Element);
 
     expect(quote).toEqual({ exact: "A", prefix: "AxAy", suffix: "z" });
+  });
+
+  test("複数行インデントされた同じ文言が複数あっても、前後の文脈スコアで正しい要素を特定できる", () => {
+    const doc = createTestDocument(`<html><body>
+      <div><span>セクションA</span><p class="multi">
+        1行目のテキスト
+        2行目のテキスト
+      </p></div>
+      <div><span>セクションB</span><p class="multi" id="second">
+        1行目のテキスト
+        2行目のテキスト
+      </p></div>
+    </body></html>`);
+    const target = doc.getElementById("second") as Element;
+    const locator = {
+      ...captureElementLocator(doc, target),
+      selector: ".non-existent",
+    };
+
+    const resolved = resolveElementLocator(doc, locator);
+
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      expect(resolved.value.element).toBe(target);
+      expect(resolved.value.confidence).toBe("text_quote");
+    }
+  });
+});
+
+describe("ライブプレビュー・エディタ・エクスポートの整合性", () => {
+  test("文言差し替えでライブプレビュー適用後でも、同じ文言の別要素へアンカーがワープせず exact_selector を維持する", () => {
+    const url = "https://shop.example.com/";
+    const doc = createTestDocument(
+      '<html><body><button id="b1">購入する</button><button id="b2">購入する</button></body></html>',
+    );
+    const btn1 = doc.getElementById("b1") as Element;
+    const locator = captureElementLocator(doc, btn1);
+    const item: Item = {
+      seq: 1,
+      url,
+      anchor: { kind: "element", locator, rect: { x: 10, y: 10, w: 80, h: 30 } },
+      changeType: "TEXT_REPLACE",
+      before: "購入する",
+      after: "今すぐ購入する",
+      attachmentIds: [],
+    };
+    const livePreview = createLivePreviewController();
+    livePreview.syncItems(doc, [item], url, () => undefined);
+
+    const anchors = resolvePageAnchors(doc, [item], url, livePreview.getResolvedTarget);
+
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0]?.confidence).toBe("exact_selector");
+  });
+
+  test("親要素に削除やリンク変更プレビューが当たっていても、子要素が DOM から切り離されない", () => {
+    const url = "https://shop.example.com/";
+    const doc = createTestDocument(
+      '<html><body><div id="card"><span id="child">子テキスト</span></div></body></html>',
+    );
+    const card = doc.getElementById("card") as Element;
+    const child = doc.getElementById("child") as Element;
+    const item: Item = {
+      seq: 1,
+      url,
+      anchor: {
+        kind: "element",
+        locator: captureElementLocator(doc, card),
+        rect: { x: 0, y: 0, w: 100, h: 40 },
+      },
+      changeType: "DELETE",
+      before: "子テキスト",
+      attachmentIds: [],
+    };
+    const livePreview = createLivePreviewController();
+    livePreview.syncItems(doc, [item], url, () => undefined);
+
+    const editor = createEditorStateForElement(doc, child, livePreview.withCleanDom);
+
+    expect(child.isConnected).toBe(true);
+    expect(editor.anchor.kind).toBe("element");
+    if (editor.anchor.kind === "element") {
+      expect(editor.anchor.locator.domPath.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("500文字を超える長文要素をクリックして編集しても、エディタの初期文言が500文字で切り捨てられない", () => {
+    const longText = "あ".repeat(650);
+    const doc = createTestDocument(`<html><body><p id="long">${longText}</p></body></html>`);
+    const p = doc.getElementById("long") as Element;
+
+    const editor = createEditorStateForElement(doc, p, (fn) => fn());
+
+    expect(editor.initialText.length).toBe(650);
+    expect(editor.currentText.length).toBe(650);
+  });
+
+  test("範囲選択（region）アイテムの再編集で seq とメモが引き継がれ、差分プレビューで範囲ボックスが描画される", () => {
+    const doc = createTestDocument("<html><body><main><p>テスト</p></main></body></html>");
+    const initialEditor = createEditorStateForRegion(doc, { x: 20, y: 30, w: 120, h: 60 }, (fn) =>
+      fn(),
+    );
+    const regionItem: Item = {
+      seq: 4,
+      url: "https://shop.example.com/",
+      anchor: initialEditor.anchor,
+      changeType: "OTHER",
+      memo: "余白を詰める",
+      attachmentIds: [],
+    };
+
+    const reEdited = createEditorStateForRegion(
+      doc,
+      { x: 20, y: 30, w: 120, h: 60 },
+      (fn) => fn(),
+      regionItem,
+    );
+    expect(reEdited.editingSeq).toBe(4);
+    expect(reEdited.memo).toBe("余白を詰める");
+
+    applyPreviewToClonedDocument(doc, [regionItem], "diff", () => undefined);
+    expect(doc.querySelector('[data-pcr-region-seq="4"]')).not.toBeNull();
+  });
+
+  test("スナップショット取得完了前に連続で確定しても、nextSeq が即座に進み同じ番号で衝突しない", () => {
+    const locator: ElementLocator = {
+      selector: "p",
+      textQuote: { exact: "旧", prefix: "", suffix: "" },
+      tagName: "p",
+      domPath: [1, 0],
+    };
+    const makeEditor = (afterText: string): DraftEditorState => ({
+      targetKind: "text",
+      anchor: { kind: "element", locator, rect: { x: 0, y: 0, w: 10, h: 10 } },
+      expansionHistory: [],
+      initialText: "旧",
+      currentText: afterText,
+      memo: "",
+      isDeleteRequested: false,
+      hasChildFormatting: false,
+      popoverRect: { x: 0, y: 0, w: 10, h: 10 },
+    });
+    const s0 = createInitialState("https://shop.example.com/", false);
+    const s1 = update(update(s0, { type: "OPEN_EDITOR", editor: makeEditor("新1") }).state, {
+      type: "CONFIRM_EDITOR",
+    });
+    const s2 = update(update(s1.state, { type: "OPEN_EDITOR", editor: makeEditor("新2") }).state, {
+      type: "CONFIRM_EDITOR",
+    });
+
+    const eff1 = s1.effects[0];
+    const eff2 = s2.effects[0];
+    expect(eff1?.type === "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM" && eff1.pendingItem.seq).toBe(1);
+    expect(eff2?.type === "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM" && eff2.pendingItem.seq).toBe(2);
+  });
+
+  test("レポート出力時は現在の変更項目から参照されているスナップショットと添付画像だけが出力される", () => {
+    const rawDoc: ChangeRequestDoc = {
+      schemaVersion: 1,
+      toolVersion: "0.1.0",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      origin: "https://shop.example.com",
+      snapshots: [
+        {
+          id: "snap-used",
+          url: "https://shop.example.com/",
+          title: "t",
+          viewport: { w: 1280, h: 800 },
+          scroll: { x: 0, y: 0 },
+          capturedAt: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: "snap-orphan",
+          url: "https://shop.example.com/old",
+          title: "old",
+          viewport: { w: 1280, h: 800 },
+          scroll: { x: 0, y: 0 },
+          capturedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      items: [
+        {
+          seq: 1,
+          url: "https://shop.example.com/",
+          snapshotId: "snap-used",
+          anchor: { kind: "pageMeta" },
+          changeType: "PAGE_META",
+          attachmentIds: ["att-used"],
+        },
+      ],
+      attachments: [
+        { id: "att-used", name: "a.webp", mime: "image/webp", resourceHash: "h1" },
+        { id: "att-orphan", name: "b.webp", mime: "image/webp", resourceHash: "h2" },
+      ],
+    };
+    const bodies = new Map([
+      ["snap-used", "BODY_USED"],
+      ["snap-orphan", "BODY_ORPHAN"],
+    ]);
+
+    const { filteredDoc, filteredSnapshotBodies } = filterReferencedReportAssets(
+      rawDoc,
+      bodies,
+      new Map(),
+    );
+
+    expect(filteredDoc.snapshots.map((s) => s.id)).toEqual(["snap-used"]);
+    expect(filteredDoc.attachments.map((a) => a.id)).toEqual(["att-used"]);
+    expect(Object.keys(filteredSnapshotBodies)).toEqual(["snap-used"]);
   });
 });
 

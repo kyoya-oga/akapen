@@ -118,12 +118,34 @@ const applyImageItem = (
   }
 };
 
+const resolveOrCreateRegionBoxInDoc = (
+  doc: Document,
+  seq: number,
+  rect: { readonly x: number; readonly y: number; readonly w: number; readonly h: number },
+): Element | null => {
+  if (doc.body === null) {
+    return null;
+  }
+  const existing = doc.querySelector(`[data-pcr-region-seq="${seq}"]`);
+  if (existing !== null) {
+    return existing;
+  }
+  const box = doc.createElement("div");
+  box.setAttribute("data-pcr-region-seq", String(seq));
+  box.setAttribute(
+    "style",
+    `position:absolute;left:${rect.x}px;top:${rect.y}px;width:${Math.max(4, rect.w)}px;height:${Math.max(4, rect.h)}px;pointer-events:none;z-index:2147483640;`,
+  );
+  doc.body.appendChild(box);
+  return box;
+};
+
 const resolveItemElementInDoc = (doc: Document, item: Item): Element | null => {
   if (item.anchor.kind === "element") {
     return resolveDomPath(doc.documentElement, item.anchor.locator.domPath);
   }
   if (item.anchor.kind === "region") {
-    return resolveDomPath(doc.documentElement, item.anchor.container.domPath);
+    return resolveOrCreateRegionBoxInDoc(doc, item.seq, item.anchor.pageRect);
   }
   return null;
 };

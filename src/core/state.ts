@@ -289,6 +289,8 @@ const handleConfirmEditor = (state: AppState): UpdateResult => {
     };
   }
   const pendingItem = buildItemFromEditor(state, editor, changeType);
+  const nextSeq =
+    editor.editingSeq !== undefined ? state.nextSeq : Math.max(state.nextSeq, pendingItem.seq + 1);
   const skipSnapshot =
     changeType === "PAGE_META" ||
     state.isSnapshotExcludedPage ||
@@ -297,6 +299,7 @@ const handleConfirmEditor = (state: AppState): UpdateResult => {
   return {
     state: {
       ...state,
+      nextSeq,
       editor: null,
       statusMessage: null,
     },
@@ -431,7 +434,12 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
       };
     case "SET_PAUSED":
       return {
-        state: { ...state, isPaused: event.isPaused, hoveredRect: null },
+        state: {
+          ...state,
+          isPaused: event.isPaused,
+          isAltPressed: false,
+          hoveredRect: null,
+        },
         effects: [],
       };
     case "SET_ALT_PRESSED":
