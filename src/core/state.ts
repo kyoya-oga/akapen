@@ -14,6 +14,7 @@ import type {
   SnapshotMeta,
   TargetKind,
 } from "./types";
+import { isSafeNavigationUrl } from "./url-safety";
 
 export type AppState = {
   readonly isVisible: boolean;
@@ -110,6 +111,7 @@ export type AppEvent =
   | { readonly type: "REOPEN_RECENT_COMPLETED" }
   | { readonly type: "REQUEST_COMPLETE" }
   | { readonly type: "EXPORT_FINISHED"; readonly message: string }
+  | { readonly type: "OPERATION_FAILED"; readonly message: string }
   | { readonly type: "CLOSE_TOOL" };
 
 export type UpdateResult = {
@@ -262,10 +264,22 @@ const buildItemFromEditor = (
   };
 };
 
+export const UNSAFE_HREF_MESSAGE =
+  "リンク先に使えるのは http(s) / mailto / tel / 相対パスのみです（javascript: などは不可）";
+
+const hasUnsafeEditedHref = (editor: DraftEditorState): boolean =>
+  editor.targetKind === "link" &&
+  editor.currentHref !== undefined &&
+  editor.currentHref !== editor.initialHref &&
+  !isSafeNavigationUrl(editor.currentHref);
+
 const handleConfirmEditor = (state: AppState): UpdateResult => {
   const { editor } = state;
   if (editor === null) {
     return { state, effects: [] };
+  }
+  if (hasUnsafeEditedHref(editor)) {
+    return { state: { ...state, statusMessage: UNSAFE_HREF_MESSAGE }, effects: [] };
   }
   const changeType = evaluateEditorChangeType(editor);
   if (changeType === null) {
@@ -525,6 +539,8 @@ export const update = (state: AppState, event: AppEvent): UpdateResult => {
         },
         effects: [],
       };
+    case "OPERATION_FAILED":
+      return { state: { ...state, statusMessage: event.message }, effects: [] };
     case "CLOSE_TOOL":
       return {
         state: { ...state, isVisible: false, editor: null },

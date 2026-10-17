@@ -58,15 +58,16 @@ const idbGetAll = <T>(db: IDBDatabase, storeName: string): Promise<readonly T[]>
     }
   });
 
-const idbPut = <T>(db: IDBDatabase, storeName: string, value: T): Promise<void> =>
+const idbPut = <T>(db: IDBDatabase, storeName: string, value: T): Promise<boolean> =>
   new Promise((resolve) => {
     try {
       const tx = db.transaction(storeName, "readwrite");
       tx.objectStore(storeName).put(value);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
     } catch {
-      resolve();
+      resolve(false);
     }
   });
 
@@ -152,18 +153,21 @@ export const saveDraftAndAssetsToDb = async (
   draft: DraftRecord,
   snapshotBodies: Readonly<Record<string, string>>,
   resources: Readonly<Record<string, ResourceEntry>>,
-): Promise<void> => {
+): Promise<boolean> => {
   const db = await openDatabase();
   if (db === null) {
-    return;
+    return false;
   }
-  await idbPut(db, STORE_DRAFTS, draft);
-  await Promise.all(
+  const draftSaved = await idbPut(db, STORE_DRAFTS, draft);
+  const bodyResults = await Promise.all(
     Object.entries(snapshotBodies).map(([id, base64]) =>
       idbPut(db, STORE_SNAPSHOT_BODIES, { id, base64 }),
     ),
   );
-  await Promise.all(Object.values(resources).map((res) => idbPut(db, STORE_RESOURCES, res)));
+  const resourceResults = await Promise.all(
+    Object.values(resources).map((res) => idbPut(db, STORE_RESOURCES, res)),
+  );
+  return [draftSaved, ...bodyResults, ...resourceResults].every((saved) => saved);
 };
 
 export const markDraftAsCompletedInDb = async (draft: DraftRecord): Promise<void> => {

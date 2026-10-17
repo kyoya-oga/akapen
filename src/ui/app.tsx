@@ -1,4 +1,5 @@
 import type { JSX } from "preact";
+import { isConfirmEnter } from "../core/keyboard";
 import { formatChangeTypeLabel } from "../core/markdown";
 import type { AppEvent, AppState } from "../core/state";
 import {
@@ -181,7 +182,7 @@ const TextOrLinkEditorFields = ({
     );
   }
   const handleTextKeyDown = (e: KeyboardEvent): void => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (isConfirmEnter(e)) {
       e.preventDefault();
       dispatch({ type: "CONFIRM_EDITOR" });
     }
@@ -330,7 +331,7 @@ const EditorPopover = ({
           placeholder="任意メモを入力"
           value={editor.memo}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (isConfirmEnter(e)) {
               e.preventDefault();
               dispatch({ type: "CONFIRM_EDITOR" });
             }

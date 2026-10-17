@@ -10,8 +10,7 @@ export const encodeJsonToBase64 = (data: unknown): string => {
   return uint8ArrayToBase64(bytes);
 };
 
-export const escapeScriptContent = (text: string): string =>
-  text.replace(/<\/script/gi, "<\\/script");
+export const escapeScriptContent = (jsonText: string): string => jsonText.replace(/</g, "\\u003c");
 
 export const escapeHtmlText = (text: string): string =>
   text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -48,6 +47,8 @@ export const buildReportHtmlString = (params: BuildReportHtmlParams): string => 
   const resourcesBase64 = encodeJsonToBase64(params.resources);
   const cspContent = [
     "default-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
     `script-src 'sha256-${params.viewerScriptSha256Base64}'`,
     "style-src 'unsafe-inline' https:",
     "img-src data: blob: https:",

@@ -1,3 +1,5 @@
+import { isDangerousUrl } from "./url-safety";
+
 export const HOST_ELEMENT_ID = "pcr-bookmarklet-host";
 
 const EXCLUDED_PATH_PATTERNS: readonly RegExp[] = [
@@ -92,7 +94,6 @@ const sanitizeFormElement = (el: Element): void => {
 };
 
 const URL_ATTRIBUTES = new Set(["href", "src", "action", "formaction"]);
-const DANGEROUS_URL_PATTERN = /^(javascript:|vbscript:|data:text\/html)/i;
 
 const sanitizeUrlAttribute = (
   el: Element,
@@ -100,7 +101,7 @@ const sanitizeUrlAttribute = (
   val: string,
   baseUrl: string,
 ): void => {
-  if (DANGEROUS_URL_PATTERN.test(val.trim())) {
+  if (isDangerousUrl(val)) {
     el.setAttribute(attrName, "#");
     return;
   }
@@ -132,7 +133,7 @@ const sanitizeAttributes = (el: Element, baseUrl: string): void => {
   Array.from(el.attributes).map((attr) => sanitizeSingleAttribute(el, attr, baseUrl));
 };
 
-const REMOVABLE_TAGS = new Set(["script", "noscript", "object", "embed", "applet"]);
+const REMOVABLE_TAGS = new Set(["script", "noscript", "object", "embed", "applet", "base"]);
 const REMOVABLE_LINK_RELS = new Set(["preload", "modulepreload", "prefetch", "prerender"]);
 
 const isSensitiveMeta = (el: Element): boolean => {

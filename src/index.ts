@@ -235,22 +235,40 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", item: pendingItem });
       return;
     }
-    const captured = await captureCleanSnapshot(
-      doc,
-      livePreview.withCleanDom,
-      Object.fromEntries(ctx.resources),
-    );
-    ctx.snapshotBodies.set(captured.meta.id, captured.compressedHtmlBase64);
-    captured.newResources.map((r) => ctx.resources.set(r.hash, r));
-    const itemWithSnap: Item = { ...pendingItem, snapshotId: captured.meta.id };
-    dispatch({
-      type: "SNAPSHOT_CAPTURED_FOR_ITEM",
-      item: itemWithSnap,
-      snapshot: captured.meta,
-    });
+    try {
+      const captured = await captureCleanSnapshot(
+        doc,
+        livePreview.withCleanDom,
+        Object.fromEntries(ctx.resources),
+      );
+      ctx.snapshotBodies.set(captured.meta.id, captured.compressedHtmlBase64);
+      captured.newResources.map((r) => ctx.resources.set(r.hash, r));
+      const itemWithSnap: Item = { ...pendingItem, snapshotId: captured.meta.id };
+      dispatch({
+        type: "SNAPSHOT_CAPTURED_FOR_ITEM",
+        item: itemWithSnap,
+        snapshot: captured.meta,
+      });
+    } catch (error) {
+      console.error("[page-change-request] snapshot capture failed", error);
+      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", item: pendingItem });
+      dispatch({
+        type: "OPERATION_FAILED",
+        message: "画面スナップショットの取得に失敗しました（指摘は保存済み）",
+      });
+    }
   };
 
   const executeCompleteAndExport = async (): Promise<void> => {
+    try {
+      await exportReport();
+    } catch (error) {
+      console.error("[page-change-request] export failed", error);
+      dispatch({ type: "OPERATION_FAILED", message: "エクスポートに失敗しました" });
+    }
+  };
+
+  const exportReport = async (): Promise<void> => {
     const exportDoc: ChangeRequestDoc = {
       schemaVersion: SCHEMA_VERSION,
       toolVersion: TOOL_VERSION,
@@ -302,7 +320,14 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
         buildDraftRecord(),
         Object.fromEntries(ctx.snapshotBodies),
         Object.fromEntries(ctx.resources),
-      );
+      ).then((isSaved) => {
+        if (!isSaved) {
+          dispatch({
+            type: "OPERATION_FAILED",
+            message: "下書きを保存できませんでした（ブラウザを閉じると消えます）",
+          });
+        }
+      });
     }, SAVE_DEBOUNCE_MS);
   };
 

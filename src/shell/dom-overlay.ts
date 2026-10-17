@@ -280,6 +280,9 @@ export const mountShadowHost = (
   );
   doc.documentElement.appendChild(host);
   const shadowRoot = host.attachShadow({ mode: "open" });
+  ["keydown", "keyup", "keypress"].map((type) =>
+    host.addEventListener(type, (e) => e.stopPropagation()),
+  );
 
   const applyAdoptedStyles = (): boolean => {
     if ("adoptedStyleSheets" in shadowRoot && typeof CSSStyleSheet !== "undefined") {

@@ -39,18 +39,22 @@ const isInsideNonTextElement = (node: Node): boolean => {
   return checkParent(node.parentElement);
 };
 
-const collectTextNodes = (root: Node, doc: Document): readonly Node[] => {
-  const walker = doc.createTreeWalker(root, -1); // NodeFilter.SHOW_ALL = -1
-  const step = (acc: readonly Node[]): readonly Node[] => {
-    const next = walker.nextNode();
-    if (next === null) {
-      return acc;
-    }
-    const isVisibleText = next.nodeType === 3 && !isInsideNonTextElement(next);
-    return step(isVisibleText ? [...acc, next] : acc);
-  };
-  return step([]);
-};
+const SHOW_ALL = -1;
+const TEXT_NODE = 3;
+
+const walkerToIterable = (walker: TreeWalker): Iterable<Node> => ({
+  [Symbol.iterator]: (): Iterator<Node> => ({
+    next: (): IteratorResult<Node> => {
+      const node = walker.nextNode();
+      return node === null ? { done: true, value: undefined } : { done: false, value: node };
+    },
+  }),
+});
+
+const collectTextNodes = (root: Node, doc: Document): readonly Node[] =>
+  Array.from(walkerToIterable(doc.createTreeWalker(root, SHOW_ALL))).filter(
+    (node) => node.nodeType === TEXT_NODE && !isInsideNonTextElement(node),
+  );
 
 export const extractCleanElementText = (doc: Document, element: Element): string => {
   const nodes = collectTextNodes(element, doc);
@@ -64,30 +68,18 @@ export const extractCleanElementText = (doc: Document, element: Element): string
 };
 
 const collectTextSegments = (root: Node, doc: Document): readonly TextSegment[] => {
-  const textNodes = collectTextNodes(root, doc);
-  const { segments } = textNodes.reduce<{
-    readonly offset: number;
-    readonly segments: readonly TextSegment[];
-  }>(
-    (acc, node) => {
-      const raw = node.textContent ?? "";
-      if (raw.length === 0) {
-        return acc;
-      }
-      const seg: TextSegment = {
-        node,
-        text: raw,
-        start: acc.offset,
-        end: acc.offset + raw.length,
-      };
-      return {
-        offset: acc.offset + raw.length,
-        segments: [...acc.segments, seg],
-      };
-    },
-    { offset: 0, segments: [] },
+  const nonEmpty = collectTextNodes(root, doc).filter(
+    (node) => (node.textContent ?? "").length > 0,
   );
-  return segments;
+  const ends = nonEmpty.reduce<number[]>((acc, node) => {
+    acc.push((acc[acc.length - 1] ?? 0) + (node.textContent ?? "").length);
+    return acc;
+  }, []);
+  return nonEmpty.map((node, idx) => {
+    const text = node.textContent ?? "";
+    const end = ends[idx] ?? 0;
+    return { node, text, start: end - text.length, end };
+  });
 };
 
 export const buildTextQuote = (doc: Document, target: Element): TextQuote => {
@@ -235,14 +227,9 @@ const findOccurrences = (text: string, needle: string): readonly number[] => {
   if (needle.length === 0) {
     return [];
   }
-  const step = (fromIndex: number, acc: readonly number[]): readonly number[] => {
-    const idx = text.indexOf(needle, fromIndex);
-    if (idx === -1) {
-      return acc;
-    }
-    return step(idx + 1, [...acc, idx]);
-  };
-  return step(0, []);
+  return Array.from({ length: text.length - needle.length + 1 }, (_, idx) => idx).filter((idx) =>
+    text.startsWith(needle, idx),
+  );
 };
 
 const searchByTextQuote = (doc: Document, locator: ElementLocator): Element | null => {

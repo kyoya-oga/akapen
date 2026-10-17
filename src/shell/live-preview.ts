@@ -1,5 +1,6 @@
 import { findClosestLink, resolveElementLocator } from "../core/anchor";
 import type { Item } from "../core/types";
+import { isSafeNavigationUrl } from "../core/url-safety";
 
 export type OriginalElementSnapshot = {
   readonly element: Element;
@@ -81,7 +82,7 @@ const applySingleLiveChange = (
   if (item.after !== undefined) {
     element.textContent = item.after;
   }
-  if (item.hrefAfter !== undefined) {
+  if (item.hrefAfter !== undefined && isSafeNavigationUrl(item.hrefAfter)) {
     const linkEl = findClosestLink(element) ?? element;
     linkEl.setAttribute("href", item.hrefAfter);
   }

@@ -1,5 +1,6 @@
 import { findClosestLink, resolveDomPath } from "./dom-path";
 import type { Item } from "./types";
+import { isSafeNavigationUrl } from "./url-safety";
 
 export type PreviewMode = "before" | "after" | "diff";
 
@@ -12,23 +13,24 @@ export const computeCharDiff = (before: string, after: string): readonly DiffSeg
   if (before === after) {
     return before.length > 0 ? [{ kind: "equal", text: before }] : [];
   }
-  const findCommonPrefixLen = (idx: number): number => {
-    if (idx >= before.length || idx >= after.length || before[idx] !== after[idx]) {
-      return idx;
-    }
-    return findCommonPrefixLen(idx + 1);
+  const indices = (length: number): readonly number[] =>
+    Array.from({ length: Math.max(0, length) }, (_, idx) => idx);
+  const firstIndexOrLength = (
+    candidates: readonly number[],
+    isDifferent: (i: number) => boolean,
+  ) => {
+    const found = candidates.findIndex(isDifferent);
+    return found === -1 ? candidates.length : found;
   };
-  const prefixLen = findCommonPrefixLen(0);
 
-  const findCommonSuffixLen = (idx: number): number => {
-    const bIdx = before.length - 1 - idx;
-    const aIdx = after.length - 1 - idx;
-    if (bIdx < prefixLen || aIdx < prefixLen || before[bIdx] !== after[aIdx]) {
-      return idx;
-    }
-    return findCommonSuffixLen(idx + 1);
-  };
-  const suffixLen = findCommonSuffixLen(0);
+  const maxPrefix = Math.min(before.length, after.length);
+  const prefixLen = firstIndexOrLength(indices(maxPrefix), (i) => before[i] !== after[i]);
+
+  const maxSuffix = maxPrefix - prefixLen;
+  const suffixLen = firstIndexOrLength(
+    indices(maxSuffix),
+    (i) => before[before.length - 1 - i] !== after[after.length - 1 - i],
+  );
 
   const prefix = before.slice(0, prefixLen);
   const deleted = before.slice(prefixLen, before.length - suffixLen);
@@ -58,7 +60,7 @@ const applyTextOrLinkItem = (target: Element, item: Item, mode: PreviewMode): vo
   if (item.after !== undefined) {
     target.textContent = item.after;
   }
-  if (item.hrefAfter !== undefined) {
+  if (item.hrefAfter !== undefined && isSafeNavigationUrl(item.hrefAfter)) {
     const linkEl = findClosestLink(target) ?? target;
     linkEl.setAttribute("href", item.hrefAfter);
     if (mode === "diff") {
