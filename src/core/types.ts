@@ -1,4 +1,4 @@
-export const TOOL_VERSION = "0.2.0";
+export const TOOL_VERSION = "0.3.0";
 export const SCHEMA_VERSION = 1 as const;
 
 export type Rect = {
@@ -82,6 +82,8 @@ export type SnapshotMeta = {
   readonly viewport: { readonly w: number; readonly h: number };
   readonly scroll: { readonly x: number; readonly y: number };
   readonly capturedAt: string;
+  /** スナップショット本文が参照する画像・フォントのハッシュ（未参照リソースの除外に使う） */
+  readonly resourceHashes?: readonly string[];
 };
 
 export type AttachmentMeta = {
@@ -120,6 +122,8 @@ export type DraftEditorState = {
   readonly isDeleteRequested: boolean;
   readonly hasChildFormatting: boolean;
   readonly popoverRect: Rect;
+  /** エディタを開いた時点の入力内容。未確定の変更があるかの判定に使う */
+  readonly pristineKey?: string;
 };
 
 export type AnchorMatchConfidence =

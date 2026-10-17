@@ -1,12 +1,12 @@
 import { h, render } from "preact";
 import { resolveElementLocator } from "./core/anchor";
 import { generateTicketMarkdown } from "./core/markdown";
-import { shouldExcludeSnapshotForUrl } from "./core/sanitize";
 import {
   type AppEvent,
   type AppState,
   type Effect,
   createInitialState,
+  isEditorDirty,
   update,
 } from "./core/state";
 import {
@@ -15,16 +15,21 @@ import {
   type Item,
   type Rect,
   SCHEMA_VERSION,
+  type SnapshotMeta,
   TOOL_VERSION,
 } from "./core/types";
+import { decompressGzipBase64ToString } from "./shell/codec";
 import {
+  type AnchorTarget,
   createEditorStateForElement,
   createEditorStateForPageMeta,
   createEditorStateForRegion,
   expandCurrentEditorLocator,
   getElementPageRect,
+  measureAnchorTargets,
   mountShadowHost,
-  resolvePageAnchors,
+  normalizePickTarget,
+  resolvePageAnchorTargets,
   shrinkCurrentEditorLocator,
 } from "./shell/dom-overlay";
 import {
@@ -49,8 +54,11 @@ import {
 } from "./shell/storage-idb";
 import { OverlayApp } from "./ui/app";
 import { OVERLAY_CSS } from "./ui/styles";
-import { EMBEDDED_VIEWER_SCRIPT, EMBEDDED_VIEWER_SHA256_BASE64 } from "./viewer/embedded-bundle";
-import { VIEWER_CSS } from "./viewer/styles";
+import {
+  EMBEDDED_VIEWER_CSS_GZIP_BASE64,
+  EMBEDDED_VIEWER_SCRIPT_GZIP_BASE64,
+  EMBEDDED_VIEWER_SHA256_BASE64,
+} from "./viewer/embedded-bundle";
 
 export type PageChangeRequestGlobal = {
   readonly toggle: () => void;
@@ -63,8 +71,11 @@ declare global {
   }
 }
 
-const DRAG_THRESHOLD_PX = 5;
+// トラックパッドやマウスのわずかなぶれで範囲選択にならないよう、少し余裕を持たせる
+const DRAG_THRESHOLD_PX = 12;
 const SAVE_DEBOUNCE_MS = 500;
+const STATUS_DISPLAY_MS = 5000;
+const UNRESOLVED_RETRY_MS = 500;
 
 const isEventInsideHost = (event: Event, host: HTMLElement): boolean =>
   event.composedPath().includes(host);
@@ -101,7 +112,17 @@ export const filterReferencedReportAssets = (
   const filteredSnapshotBodies = Object.fromEntries(
     Array.from(snapshotBodies.entries()).filter(([id]) => referencedSnapshotIds.has(id)),
   );
-  const filteredResources = Object.fromEntries(resources);
+  // 参照の記録が無い古いスナップショットが混ざるときだけ、取りこぼしを避けて全件残す
+  const hasLegacySnapshot = filteredSnapshots.some((s) => s.resourceHashes === undefined);
+  const referencedHashes = new Set([
+    ...filteredSnapshots.flatMap((s) => s.resourceHashes ?? []),
+    ...filteredAttachments.map((a) => a.resourceHash),
+  ]);
+  const filteredResources = Object.fromEntries(
+    Array.from(resources.entries()).filter(
+      ([hash]) => hasLegacySnapshot || referencedHashes.has(hash),
+    ),
+  );
 
   return {
     filteredDoc: {
@@ -114,14 +135,31 @@ export const filterReferencedReportAssets = (
   };
 };
 
+type LastSnapshot = {
+  readonly meta: SnapshotMeta;
+  readonly domVersion: number;
+  readonly viewportW: number;
+};
+
 type RuntimeContext = {
   state: AppState;
   readonly snapshotBodies: Map<string, string>;
   readonly resources: Map<string, ResourceEntry>;
   readonly previewUrls: Map<string, string>;
+  readonly pendingCaptures: Set<Promise<void>>;
   saveTimerId: ReturnType<typeof setTimeout> | null;
+  statusTimerId: ReturnType<typeof setTimeout> | null;
   rafId: number | null;
+  hoverRafId: number | null;
+  hoverPoint: { readonly x: number; readonly y: number } | null;
   pointerDownPos: { readonly x: number; readonly y: number } | null;
+  anchorTargets: readonly AnchorTarget[];
+  anchorsDirty: boolean;
+  previewDirty: boolean;
+  lastUnresolvedRetryAt: number;
+  /** ページ側（ツール以外）による DOM 変更の回数。スナップショットを使い回せるかの判定に使う */
+  domVersion: number;
+  lastSnapshotByUrl: Map<string, LastSnapshot>;
 };
 
 export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
@@ -133,20 +171,43 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
 
   const doc = document;
   const { host, mountNode } = mountShadowHost(doc, OVERLAY_CSS);
-  const livePreview = createLivePreviewController();
 
   const ctx: RuntimeContext = {
-    state: createInitialState(
-      window.location.href,
-      shouldExcludeSnapshotForUrl(window.location.href),
-    ),
+    state: createInitialState(window.location.href),
     snapshotBodies: new Map<string, string>(),
     resources: new Map<string, ResourceEntry>(),
     previewUrls: new Map<string, string>(),
+    pendingCaptures: new Set<Promise<void>>(),
     saveTimerId: null,
+    statusTimerId: null,
     rafId: null,
+    hoverRafId: null,
+    hoverPoint: null,
     pointerDownPos: null,
+    anchorTargets: [],
+    anchorsDirty: true,
+    previewDirty: false,
+    lastUnresolvedRetryAt: 0,
+    domVersion: 0,
+    lastSnapshotByUrl: new Map<string, LastSnapshot>(),
   };
+
+  // ツール自身のプレビュー書き換えはページ側の変更として扱わない。
+  // 書き換え前に溜まっていた記録は退避して処理し、書き換え中の記録は捨てる
+  const pendingMutationRecords: MutationRecord[] = [];
+  const mutationObserver = new MutationObserver((records) => handlePageMutations(records));
+  const livePreview = createLivePreviewController({
+    beforeMutate: () => {
+      pendingMutationRecords.push(...mutationObserver.takeRecords());
+    },
+    afterMutate: () => {
+      mutationObserver.takeRecords();
+      if (pendingMutationRecords.length > 0) {
+        const records = pendingMutationRecords.splice(0);
+        queueMicrotask(() => handlePageMutations(records));
+      }
+    },
+  });
 
   const getAttachmentPreviewUrl = (attId: string): string | undefined => {
     const cached = ctx.previewUrls.get(attId);
@@ -192,7 +253,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
         onAttachmentFileSelected: (file: File) => {
           void processAttachmentImageFile(file).then((res) => {
             if (!res.ok) {
-              window.alert(res.error);
+              dispatch({ type: "OPERATION_FAILED", message: res.error });
               return;
             }
             ctx.resources.set(res.value.resource.hash, res.value.resource);
@@ -209,31 +270,59 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     );
   };
 
-  const scheduleAnchorRefresh = (): void => {
+  // 1 フレームに 1 回だけ、必要な処理（プレビューの当て直し・要素の特定・位置の計測）を行う。
+  // スクロール時は位置の計測だけで済ませ、重い要素の特定は DOM や項目が変わったときに限る
+  const scheduleFrame = (): void => {
     if (ctx.rafId !== null) {
       return;
     }
     ctx.rafId = window.requestAnimationFrame(() => {
       ctx.rafId = null;
       if (window.location.href !== ctx.state.currentUrl) {
-        dispatch({
-          type: "URL_CHANGED",
-          url: window.location.href,
-          isExcluded: shouldExcludeSnapshotForUrl(window.location.href),
-        });
+        dispatch({ type: "URL_CHANGED", url: window.location.href });
       }
-      const resolved = resolvePageAnchors(
-        doc,
-
-        ctx.state.items,
-
-        ctx.state.currentUrl,
-        livePreview.getResolvedTarget,
-      );
-      ctx.state = { ...ctx.state, resolvedAnchors: resolved };
+      if (ctx.previewDirty) {
+        ctx.previewDirty = false;
+        livePreview.resync();
+        ctx.anchorsDirty = true;
+      }
+      if (ctx.anchorsDirty) {
+        ctx.anchorsDirty = false;
+        ctx.anchorTargets = resolvePageAnchorTargets(
+          doc,
+          ctx.state.items,
+          ctx.state.currentUrl,
+          livePreview.getResolvedTarget,
+        );
+      }
+      ctx.state = { ...ctx.state, resolvedAnchors: measureAnchorTargets(doc, ctx.anchorTargets) };
       renderApp();
     });
   };
+
+  const scheduleAnchorRefresh = (): void => {
+    ctx.anchorsDirty = true;
+    scheduleFrame();
+  };
+
+  const onScrollOrResize = (): void => scheduleFrame();
+
+  function handlePageMutations(records: readonly MutationRecord[]): void {
+    if (records.length === 0) {
+      return;
+    }
+    ctx.domVersion += 1;
+    // React などの再描画でプレビューが消えた・要素が作り直されたときは当て直す。
+    // まだ見つかっていない項目（遅延表示される要素など）は間隔を空けて探し直す
+    const now = Date.now();
+    const shouldRetryUnresolved =
+      livePreview.hasUnresolvedItems() && now - ctx.lastUnresolvedRetryAt > UNRESOLVED_RETRY_MS;
+    if (livePreview.isAffectedByMutations(records) || shouldRetryUnresolved) {
+      ctx.lastUnresolvedRetryAt = now;
+      ctx.previewDirty = true;
+    }
+    scheduleAnchorRefresh();
+  }
 
   const openEditorForElementAndItem = (element: Element, existingItem?: Item): void => {
     const ed = createEditorStateForElement(doc, element, livePreview.withCleanDom, existingItem);
@@ -285,14 +374,27 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       return cached?.element === target;
     });
 
-  const executeCaptureSnapshotEffect = async (
-    pendingItem: Item,
-    skipSnapshot: boolean,
-  ): Promise<void> => {
-    if (skipSnapshot) {
-      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", item: pendingItem });
+  // 前回の記録から DOM も画面幅も変わっていなければ、同じスナップショットを使い回す
+  const findReusableSnapshot = (url: string): SnapshotMeta | null => {
+    const last = ctx.lastSnapshotByUrl.get(url);
+    if (
+      last === undefined ||
+      last.domVersion !== ctx.domVersion ||
+      last.viewportW !== window.innerWidth ||
+      !ctx.snapshotBodies.has(last.meta.id)
+    ) {
+      return null;
+    }
+    return last.meta;
+  };
+
+  const captureSnapshotForItem = async (item: Item): Promise<void> => {
+    const reusable = findReusableSnapshot(item.url);
+    if (reusable !== null) {
+      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", seq: item.seq, snapshot: reusable });
       return;
     }
+    const domVersionAtStart = ctx.domVersion;
     try {
       const captured = await captureCleanSnapshot(
         doc,
@@ -301,20 +403,26 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       );
       ctx.snapshotBodies.set(captured.meta.id, captured.compressedHtmlBase64);
       captured.newResources.map((r) => ctx.resources.set(r.hash, r));
-      const itemWithSnap: Item = { ...pendingItem, snapshotId: captured.meta.id };
-      dispatch({
-        type: "SNAPSHOT_CAPTURED_FOR_ITEM",
-        item: itemWithSnap,
-        snapshot: captured.meta,
+      ctx.lastSnapshotByUrl.set(item.url, {
+        meta: captured.meta,
+        domVersion: domVersionAtStart,
+        viewportW: captured.meta.viewport.w,
       });
+      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", seq: item.seq, snapshot: captured.meta });
     } catch (error) {
       console.error("[page-change-request] snapshot capture failed", error);
-      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", item: pendingItem });
+      dispatch({ type: "SNAPSHOT_CAPTURED_FOR_ITEM", seq: item.seq });
       dispatch({
         type: "OPERATION_FAILED",
         message: "画面スナップショットの取得に失敗しました（変更内容は保存済み）",
       });
     }
+  };
+
+  const executeCaptureSnapshotEffect = (item: Item): void => {
+    const task = captureSnapshotForItem(item);
+    ctx.pendingCaptures.add(task);
+    void task.finally(() => ctx.pendingCaptures.delete(task));
   };
 
   const executeCompleteAndExport = async (): Promise<void> => {
@@ -327,6 +435,10 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
   };
 
   const exportReport = async (): Promise<void> => {
+    if (ctx.pendingCaptures.size > 0) {
+      dispatch({ type: "SHOW_STATUS", message: "画面の記録が終わるのを待っています…" });
+      await Promise.all(Array.from(ctx.pendingCaptures));
+    }
     const rawDoc: ChangeRequestDoc = {
       schemaVersion: SCHEMA_VERSION,
       toolVersion: TOOL_VERSION,
@@ -342,22 +454,24 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       ctx.resources,
     );
     const markdown = generateTicketMarkdown(filteredDoc);
-    await copyTextToClipboard(markdown);
+    const isCopied = await copyTextToClipboard(markdown);
 
     const htmlReport = buildReportHtmlString({
       pageTitle: doc.title || "ページ",
       doc: filteredDoc,
       snapshotBodies: filteredSnapshotBodies,
       resources: filteredResources,
-      viewerScript: EMBEDDED_VIEWER_SCRIPT,
+      viewerScript: await decompressGzipBase64ToString(EMBEDDED_VIEWER_SCRIPT_GZIP_BASE64),
       viewerScriptSha256Base64: EMBEDDED_VIEWER_SHA256_BASE64,
-      viewerStyles: VIEWER_CSS,
+      viewerStyles: await decompressGzipBase64ToString(EMBEDDED_VIEWER_CSS_GZIP_BASE64),
     });
     downloadHtmlReportBlob(htmlReport, formatReportFilename(doc.title));
     await markDraftAsCompletedInDb(buildDraftRecord());
     dispatch({
       type: "EXPORT_FINISHED",
-      message: "Markdown をコピーし HTML レポートを保存しました",
+      message: isCopied
+        ? "Markdown をコピーし HTML レポートを保存しました"
+        : "HTML レポートを保存しました（Markdown はコピーできなかったため、レポートの「チケット用にコピー」を使ってください）",
     });
   };
 
@@ -368,6 +482,10 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     const cached = livePreview.getResolvedTarget(item.seq);
     if (cached !== undefined) {
       return cached.element;
+    }
+    const target = ctx.anchorTargets.find((t) => t.seq === item.seq);
+    if (target?.kind === "element" && target.element?.isConnected) {
+      return target.element;
     }
     const res = resolveElementLocator(doc, item.anchor.locator, item.after);
     return res.ok ? res.value.element : null;
@@ -386,11 +504,37 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     }
   };
 
+  // 取り消した項目のスナップショット・画像をメモリに抱え続けないよう、保存のたびに整理する。
+  // 記録中のスナップショットが既存の画像を参照する可能性があるため、その間は整理しない
+  const pruneInMemoryAssets = (): void => {
+    if (ctx.state.pendingSnapshotSeqs.length > 0 || ctx.pendingCaptures.size > 0) {
+      return;
+    }
+    const snapshotIds = new Set(ctx.state.snapshots.map((s) => s.id));
+    Array.from(ctx.snapshotBodies.keys())
+      .filter((id) => !snapshotIds.has(id))
+      .map((id) => ctx.snapshotBodies.delete(id));
+    if (ctx.state.snapshots.some((s) => s.resourceHashes === undefined)) {
+      return;
+    }
+    const hashes = new Set([
+      ...ctx.state.snapshots.flatMap((s) => s.resourceHashes ?? []),
+      ...ctx.state.attachments.map((a) => a.resourceHash),
+    ]);
+    Array.from(ctx.resources.keys())
+      .filter((hash) => !hashes.has(hash))
+      .map((hash) => ctx.resources.delete(hash));
+    Array.from(ctx.lastSnapshotByUrl.entries())
+      .filter(([, last]) => !snapshotIds.has(last.meta.id))
+      .map(([url]) => ctx.lastSnapshotByUrl.delete(url));
+  };
+
   const scheduleDebouncedDraftSave = (): void => {
     if (ctx.saveTimerId !== null) {
       clearTimeout(ctx.saveTimerId);
     }
     ctx.saveTimerId = setTimeout(() => {
+      pruneInMemoryAssets();
       void saveDraftAndAssetsToDb(
         buildDraftRecord(),
         Object.fromEntries(ctx.snapshotBodies),
@@ -450,11 +594,14 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
       case "LOAD_COMPLETED_DRAFT_FROM_DB":
         void hydrateCompletedDraftFromDb();
         break;
-      case "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM":
-        void executeCaptureSnapshotEffect(effect.pendingItem, effect.skipSnapshot);
+      case "CAPTURE_SNAPSHOT_FOR_ITEM":
+        executeCaptureSnapshotEffect(effect.item);
         break;
       case "SCROLL_TO_ITEM":
         scrollToTargetItem(effect.item);
+        break;
+      case "OPEN_EDITOR_FOR_ITEM":
+        handleBadgeClick(effect.seq);
         break;
       case "EXPAND_EDITOR_SELECTION":
         handleExpandOrShrinkEffect(true);
@@ -475,26 +622,82 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     }
   };
 
+  // ステータス表示は一定時間で自動的に消す
+  const syncStatusTimer = (prevMessage: string | null): void => {
+    const message = ctx.state.statusMessage;
+    if (message === prevMessage) {
+      return;
+    }
+    if (ctx.statusTimerId !== null) {
+      clearTimeout(ctx.statusTimerId);
+      ctx.statusTimerId = null;
+    }
+    if (message !== null) {
+      ctx.statusTimerId = setTimeout(() => {
+        ctx.statusTimerId = null;
+        if (ctx.state.statusMessage === message) {
+          dispatch({ type: "CLEAR_STATUS" });
+        }
+      }, STATUS_DISPLAY_MS);
+    }
+  };
+
   function dispatch(event: AppEvent): void {
+    const prevMessage = ctx.state.statusMessage;
     const result = update(ctx.state, event);
     ctx.state = result.state;
+    syncStatusTimer(prevMessage);
     renderApp();
     result.effects.map(runEffect);
   }
 
   const isPointingActive = (): boolean =>
-    ctx.state.isVisible &&
-    !ctx.state.isPaused &&
-    !ctx.state.isAltPressed &&
-    ctx.state.editor === null;
+    ctx.state.isVisible && !ctx.state.isPaused && !ctx.state.isAltPressed;
 
-  const updateHoverTargetAtPoint = (clientX: number, clientY: number): void => {
+  const pickTargetAtPoint = (clientX: number, clientY: number): Element | null => {
     const target = doc.elementFromPoint(clientX, clientY);
-    if (target === null || target === doc.documentElement || target === doc.body) {
-      dispatch({ type: "UPDATE_HOVER_RECT", rect: null });
+    if (
+      target === null ||
+      target === doc.documentElement ||
+      target === doc.body ||
+      target === host
+    ) {
+      return null;
+    }
+    return normalizePickTarget(target);
+  };
+
+  const isSameRect = (a: Rect | null, b: Rect | null): boolean =>
+    a === b ||
+    (a !== null && b !== null && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h);
+
+  // pointermove ごとに描画し直さず、1 フレームにまとめ、枠が変わったときだけ描画する
+  const scheduleHoverUpdate = (clientX: number, clientY: number): void => {
+    ctx.hoverPoint = { x: clientX, y: clientY };
+    if (ctx.hoverRafId !== null) {
       return;
     }
-    dispatch({ type: "UPDATE_HOVER_RECT", rect: getElementPageRect(doc, target) });
+    ctx.hoverRafId = window.requestAnimationFrame(() => {
+      ctx.hoverRafId = null;
+      const point = ctx.hoverPoint;
+      if (point === null || !isPointingActive()) {
+        return;
+      }
+      const target = pickTargetAtPoint(point.x, point.y);
+      const rect = target !== null ? getElementPageRect(doc, target) : null;
+      if (!isSameRect(rect, ctx.state.hoveredRect)) {
+        dispatch({ type: "UPDATE_HOVER_RECT", rect });
+      }
+    });
+  };
+
+  // 入力途中のエディタがあるときは、黙って捨てずに確認する
+  const confirmDiscardEditorIfDirty = (): boolean => {
+    const { editor } = ctx.state;
+    if (editor === null || !isEditorDirty(editor)) {
+      return true;
+    }
+    return window.confirm("入力中の内容は確定されていません。破棄して別の箇所を選びますか？");
   };
 
   const syncAltKeyFromEvent = (altKey: boolean): void => {
@@ -523,7 +726,7 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
         return;
       }
     }
-    updateHoverTargetAtPoint(e.clientX, e.clientY);
+    scheduleHoverUpdate(e.clientX, e.clientY);
   };
 
   const onPointerDown = (e: PointerEvent): void => {
@@ -540,8 +743,11 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
   };
 
   const openEditorAtPoint = (clientX: number, clientY: number): void => {
-    const target = doc.elementFromPoint(clientX, clientY);
-    if (target === null || target === doc.documentElement || target === doc.body) {
+    const target = pickTargetAtPoint(clientX, clientY);
+    if (target === null) {
+      if (ctx.state.editor !== null) {
+        dispatch({ type: "CLOSE_EDITOR" });
+      }
       return;
     }
     const existingItem = findExistingElementItemForTarget(target);
@@ -557,6 +763,10 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     const start = ctx.pointerDownPos;
     ctx.pointerDownPos = null;
     const dist = Math.hypot(e.clientX - start.x, e.clientY - start.y);
+    dispatch({ type: "UPDATE_DRAG_RECT", rect: null });
+    if (!confirmDiscardEditorIfDirty()) {
+      return;
+    }
 
     if (dist > DRAG_THRESHOLD_PX) {
       const regionRect = computeDragRect(
@@ -575,17 +785,47 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     openEditorAtPoint(e.clientX, e.clientY);
   };
 
+  // Mac では Option+クリックがリンクの「ダウンロード」になるため、
+  // Alt / Option を押したままのリンククリックは修飾キーなしのクリックとして送り直す
+  const redispatchAltLinkClick = (e: MouseEvent): boolean => {
+    const target = e.target instanceof Element ? e.target : null;
+    if (!e.isTrusted || !e.altKey || target?.closest("a[href]") == null) {
+      return false;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    target.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        screenX: e.screenX,
+        screenY: e.screenY,
+        button: e.button,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        altKey: false,
+      }),
+    );
+    return true;
+  };
+
+  const isToolDownloadClick = (e: MouseEvent): boolean =>
+    e.target instanceof Element && e.target.hasAttribute("data-pcr-download");
+
   const onClickCapture = (e: MouseEvent): void => {
-    if (isEventInsideHost(e, host)) {
+    if (!ctx.state.isVisible || isEventInsideHost(e, host) || isToolDownloadClick(e)) {
       return;
     }
-    if (e.target instanceof Element && e.target.hasAttribute("data-pcr-download")) {
+    if (ctx.state.isPaused || ctx.state.isAltPressed || e.altKey) {
+      redispatchAltLinkClick(e);
       return;
     }
-    if (ctx.state.isVisible && !ctx.state.isPaused && !ctx.state.isAltPressed && !e.altKey) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
+    e.preventDefault();
+    e.stopPropagation();
   };
 
   const handleEditorArrowKeys = (e: KeyboardEvent): void => {
@@ -634,15 +874,12 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
   window.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("keyup", onKeyUp, true);
   window.addEventListener("blur", onWindowBlur);
-  window.addEventListener("scroll", scheduleAnchorRefresh, { passive: true, capture: true });
-  window.addEventListener("resize", scheduleAnchorRefresh, { passive: true });
+  window.addEventListener("scroll", onScrollOrResize, { passive: true, capture: true });
+  window.addEventListener("resize", onScrollOrResize, { passive: true });
   window.addEventListener("popstate", scheduleAnchorRefresh);
 
-  const mutationObserver = new MutationObserver(() => {
-    scheduleAnchorRefresh();
-  });
   if (doc.body !== null) {
-    mutationObserver.observe(doc.body, { childList: true, subtree: true });
+    mutationObserver.observe(doc.body, { childList: true, subtree: true, characterData: true });
   }
 
   void detectIncognitoMode().then((isIncognito) => {
@@ -682,8 +919,14 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     if (ctx.saveTimerId !== null) {
       clearTimeout(ctx.saveTimerId);
     }
+    if (ctx.statusTimerId !== null) {
+      clearTimeout(ctx.statusTimerId);
+    }
     if (ctx.rafId !== null) {
       cancelAnimationFrame(ctx.rafId);
+    }
+    if (ctx.hoverRafId !== null) {
+      cancelAnimationFrame(ctx.hoverRafId);
     }
     mutationObserver.disconnect();
     window.removeEventListener("pointermove", onPointerMove, true);
@@ -693,8 +936,8 @@ export const launchPageChangeRequestTool = (): PageChangeRequestGlobal => {
     window.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("keyup", onKeyUp, true);
     window.removeEventListener("blur", onWindowBlur);
-    window.removeEventListener("scroll", scheduleAnchorRefresh, true);
-    window.removeEventListener("resize", scheduleAnchorRefresh);
+    window.removeEventListener("scroll", onScrollOrResize, true);
+    window.removeEventListener("resize", onScrollOrResize);
     window.removeEventListener("popstate", scheduleAnchorRefresh);
     livePreview.restoreAll();
     render(null, mountNode);

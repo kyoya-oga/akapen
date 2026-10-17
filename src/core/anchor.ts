@@ -5,7 +5,14 @@ import { type Result, err, ok } from "./result";
 import type { AnchorMatchConfidence, ElementLocator, Rect, TextQuote } from "./types";
 
 const CSS_MODULES_HASH_PATTERN = /__[A-Za-z0-9_-]{5}$/;
-const REACT_ID_PATTERN = /^:r[0-9a-zA-Z]+:$/;
+// emotion (css-1x2y3z), styled-components (sc-xxxx と kXbTqG のような乱数名), styled-jsx (jsx-1234)
+const CSS_IN_JS_CLASS_PATTERNS: readonly RegExp[] = [
+  /^css-[a-z0-9]+(-[A-Za-z0-9_]+)?$/,
+  /^sc-[A-Za-z0-9]+$/,
+  /^jsx-\d+$/,
+  /^(?=[a-zA-Z]*[a-z])(?=[a-zA-Z]*[A-Z])[a-zA-Z]{5,7}$/,
+];
+const REACT_ID_PATTERN = /^(:r[0-9a-zA-Z]+:|«r[0-9a-zA-Z]+»|_R_[0-9a-zA-Z_]+_)$/;
 const MAX_EXACT_LENGTH = 500;
 const CONTEXT_LENGTH = 32;
 
@@ -15,7 +22,9 @@ export const isStableIdName = (name: string): boolean =>
   name.length > 0 && !REACT_ID_PATTERN.test(name);
 
 export const isStableClassName = (name: string): boolean =>
-  name.length > 0 && !CSS_MODULES_HASH_PATTERN.test(name);
+  name.length > 0 &&
+  !CSS_MODULES_HASH_PATTERN.test(name) &&
+  !CSS_IN_JS_CLASS_PATTERNS.some((pattern) => pattern.test(name));
 
 type TextSegment = {
   readonly node: Node;
@@ -26,35 +35,41 @@ type TextSegment = {
 
 const NON_TEXT_TAGS = new Set(["script", "style", "noscript", "template", "svg", "iframe"]);
 
+const NON_TEXT_SELECTOR = Array.from(NON_TEXT_TAGS).join(",");
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
+
+const isNonTextElement = (el: Element): boolean => NON_TEXT_TAGS.has(el.tagName.toLowerCase());
+
 const isInsideNonTextElement = (node: Node): boolean => {
-  const checkParent = (el: Element | null): boolean => {
-    if (el === null) {
-      return false;
-    }
-    if (NON_TEXT_TAGS.has(el.tagName.toLowerCase())) {
-      return true;
-    }
-    return checkParent(el.parentElement);
-  };
-  return checkParent(node.parentElement);
+  const startEl = node.nodeType === TEXT_NODE ? node.parentElement : (node as Element);
+  return (startEl?.closest(NON_TEXT_SELECTOR) ?? null) !== null;
 };
 
-const SHOW_ALL = -1;
-const TEXT_NODE = 3;
+// script / style などはサブツリーごと飛ばし、祖先を毎回たどらない。
+// 深い DOM でもスタックが溢れないよう再帰ではなく明示的なスタックで走査する
+const shouldDescendInto = (node: Node, root: Node): boolean =>
+  node === root || (node.nodeType === ELEMENT_NODE && !isNonTextElement(node as Element));
 
-const walkerToIterable = (walker: TreeWalker): Iterable<Node> => ({
-  [Symbol.iterator]: (): Iterator<Node> => ({
-    next: (): IteratorResult<Node> => {
-      const node = walker.nextNode();
-      return node === null ? { done: true, value: undefined } : { done: false, value: node };
-    },
-  }),
-});
+const collectTextNodes = (root: Node, _doc: Document): readonly Node[] => {
+  if (isInsideNonTextElement(root)) {
+    return [];
+  }
+  const result: Node[] = [];
+  const stack: Node[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop() as Node;
+    if (node.nodeType === TEXT_NODE) {
+      result.push(node);
+    } else if (shouldDescendInto(node, root)) {
+      stack.push(...Array.from(node.childNodes).reverse());
+    }
+  }
+  return result;
+};
 
-const collectTextNodes = (root: Node, doc: Document): readonly Node[] =>
-  Array.from(walkerToIterable(doc.createTreeWalker(root, SHOW_ALL))).filter(
-    (node) => node.nodeType === TEXT_NODE && !isInsideNonTextElement(node),
-  );
+export const collectVisibleTextNodes = (doc: Document, root: Element): readonly Text[] =>
+  collectTextNodes(root, doc) as readonly Text[];
 
 export const extractFullElementText = (doc: Document, element: Element): string => {
   const nodes = collectTextNodes(element, doc);
@@ -84,13 +99,32 @@ const collectTextSegments = (root: Node, doc: Document): readonly TextSegment[] 
   });
 };
 
+export type TextIndex = {
+  readonly segments: readonly TextSegment[];
+  readonly fullText: string;
+};
+
+/** 1 回の解決処理の間だけページ全文の走査結果を使い回すための遅延キャッシュ */
+export type TextIndexProvider = () => TextIndex;
+
+export const createTextIndexProvider = (doc: Document): TextIndexProvider => {
+  const cache: { value: TextIndex | null } = { value: null };
+  return () => {
+    if (cache.value === null) {
+      const root = doc.body ?? doc.documentElement;
+      const segments = collectTextSegments(root, doc);
+      cache.value = { segments, fullText: segments.map((s) => s.text).join("") };
+    }
+    return cache.value;
+  };
+};
+
 export const buildTextQuote = (doc: Document, target: Element): TextQuote => {
   const rawExact = extractCleanElementText(doc, target);
   if (rawExact.length === 0 || doc.body === null) {
     return { exact: "", prefix: "", suffix: "" };
   }
-  const segments = collectTextSegments(doc.body, doc);
-  const fullText = segments.map((s) => s.text).join("");
+  const { segments, fullText } = createTextIndexProvider(doc)();
   const targetSegments = segments.filter((s) => target.contains(s.node));
   const firstSeg = targetSegments[0];
   const lastSeg = targetSegments[targetSegments.length - 1];
@@ -225,13 +259,21 @@ const findCommonAncestorElement = (nodes: readonly Node[], fallback: Element): E
   return ascend(first);
 };
 
+const MAX_OCCURRENCES = 200;
+
 const findOccurrences = (text: string, needle: string): readonly number[] => {
   if (needle.length === 0) {
     return [];
   }
-  return Array.from({ length: text.length - needle.length + 1 }, (_, idx) => idx).filter((idx) =>
-    text.startsWith(needle, idx),
-  );
+  const collect = (from: number, acc: number[]): readonly number[] => {
+    const idx = text.indexOf(needle, from);
+    if (idx === -1 || acc.length >= MAX_OCCURRENCES) {
+      return acc;
+    }
+    acc.push(idx);
+    return collect(idx + 1, acc);
+  };
+  return collect(0, []);
 };
 
 const scoreElementContextInSegments = (
@@ -249,14 +291,28 @@ const scoreElementContextInSegments = (
   return scoreContextMatch(fullText, firstSeg.start, lastSeg.end, quote);
 };
 
-const searchByTextQuote = (doc: Document, locator: ElementLocator): Element | null => {
+const matchesNormalizedText = (doc: Document, el: Element, normExact: string): boolean => {
+  const normRaw = normalizeWhitespace(el.textContent ?? "");
+  if (normRaw === normExact) {
+    return true;
+  }
+  if (!normRaw.includes(normExact) || el.querySelector(NON_TEXT_SELECTOR) === null) {
+    return false;
+  }
+  return normalizeWhitespace(extractCleanElementText(doc, el)) === normExact;
+};
+
+const searchByTextQuote = (
+  doc: Document,
+  locator: ElementLocator,
+  getTextIndex: TextIndexProvider,
+): Element | null => {
   const root = doc.body ?? doc.documentElement;
   const normExact = normalizeWhitespace(locator.textQuote.exact);
   if (normExact.length === 0) {
     return null;
   }
-  const segments = collectTextSegments(root, doc);
-  const fullText = segments.map((s) => s.text).join("");
+  const { segments, fullText } = getTextIndex();
   const rawIndices = findOccurrences(fullText, locator.textQuote.exact);
 
   if (rawIndices.length > 0) {
@@ -273,11 +329,7 @@ const searchByTextQuote = (doc: Document, locator: ElementLocator): Element | nu
 
   // Whitespace-normalized fallback scan across elements (with context scoring)
   const allElements = Array.from(root.querySelectorAll(locator.tagName || "*"));
-  const matchingElements = allElements.filter(
-    (el) =>
-      normalizeWhitespace(extractCleanElementText(doc, el)) === normExact ||
-      normalizeWhitespace(el.textContent ?? "") === normExact,
-  );
+  const matchingElements = allElements.filter((el) => matchesNormalizedText(doc, el, normExact));
   if (matchingElements.length === 0) {
     return null;
   }
@@ -302,6 +354,7 @@ export const resolveElementLocator = (
   doc: Document,
   locator: ElementLocator,
   expectedAfterText?: string,
+  getTextIndex: TextIndexProvider = createTextIndexProvider(doc),
 ): Result<ResolvedElementResult, string> => {
   const bySelector = safeQuerySelector(doc, locator.selector);
 
@@ -316,19 +369,23 @@ export const resolveElementLocator = (
 
   const byAfterQuote =
     expectedAfterText !== undefined && expectedAfterText.trim().length > 0
-      ? searchByTextQuote(doc, {
-          ...locator,
-          textQuote: {
-            ...locator.textQuote,
-            exact: expectedAfterText.slice(0, MAX_EXACT_LENGTH),
+      ? searchByTextQuote(
+          doc,
+          {
+            ...locator,
+            textQuote: {
+              ...locator.textQuote,
+              exact: expectedAfterText.slice(0, MAX_EXACT_LENGTH),
+            },
           },
-        })
+          getTextIndex,
+        )
       : null;
   if (byAfterQuote !== null) {
     return ok({ element: byAfterQuote, confidence: "text_quote" });
   }
 
-  const byQuote = searchByTextQuote(doc, locator);
+  const byQuote = searchByTextQuote(doc, locator, getTextIndex);
   if (byQuote !== null) {
     return ok({ element: byQuote, confidence: "text_quote" });
   }

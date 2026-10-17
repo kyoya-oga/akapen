@@ -7,6 +7,7 @@ import {
   type Item,
   type PageMetaValues,
   type Rect,
+  type ResolvedAnchor,
   TOOL_VERSION,
 } from "../core/types";
 
@@ -351,22 +352,24 @@ const EditorPopover = ({
             <button
               type="button"
               class="pcr-btn pcr-btn-danger"
+              title="この要素をページから消すよう依頼します"
               onClick={() => dispatch({ type: "REQUEST_DELETE_IN_EDITOR" })}
             >
-              この要素を削除
+              削除を依頼
             </button>
           )}
           {editor.editingSeq !== undefined && (
             <button
               type="button"
               class="pcr-btn"
+              title={`#${editor.editingSeq} の変更依頼を一覧から外します`}
               onClick={() => {
                 if (editor.editingSeq !== undefined) {
                   dispatch({ type: "DELETE_ITEM", seq: editor.editingSeq });
                 }
               }}
             >
-              この変更を取り消す
+              この変更を破棄
             </button>
           )}
         </div>
@@ -406,6 +409,7 @@ const QuickListPopover = ({
             type="button"
             class="pcr-btn"
             style={{ flex: 1, textAlign: "left", border: "none", background: "transparent" }}
+            title="この箇所へ移動して編集します"
             onClick={() => dispatch({ type: "SELECT_QUICK_LIST_ITEM", seq: item.seq })}
           >
             <strong>#{item.seq}</strong> {summarizeItemText(item)}
@@ -414,6 +418,7 @@ const QuickListPopover = ({
             type="button"
             class="pcr-btn"
             style={{ padding: "1px 6px" }}
+            title={`#${item.seq} を破棄`}
             onClick={(e) => {
               e.stopPropagation();
               dispatch({ type: "DELETE_ITEM", seq: item.seq });
@@ -424,24 +429,59 @@ const QuickListPopover = ({
         </div>
       ))
     )}
+    {items.length > 0 && (
+      <div class="pcr-quicklist-footer">
+        <button
+          type="button"
+          class="pcr-btn pcr-btn-danger-text"
+          onClick={() => {
+            if (
+              window.confirm(`変更 ${items.length} 件をすべて破棄して、1番からやり直しますか？`)
+            ) {
+              dispatch({ type: "RESET_ALL_CONFIRMED" });
+            }
+          }}
+        >
+          すべて破棄してやり直す
+        </button>
+      </div>
+    )}
   </div>
 );
 
 const ToolbarWarnings = ({ state }: { readonly state: AppState }): JSX.Element | null => {
+  const isRecording = state.pendingSnapshotSeqs.length > 0;
+  const showHint = state.items.length === 0 && state.editor === null && !state.isPaused;
   const hasAny =
-    state.isSnapshotExcludedPage || state.isIncognitoWarning || state.statusMessage !== null;
+    showHint || isRecording || state.isIncognitoWarning || state.statusMessage !== null;
   if (!hasAny) {
     return null;
   }
   return (
     <div class="pcr-warnings">
-      {state.isSnapshotExcludedPage && (
-        <div>⚠ 個人情報保護対象ページのため、画面スナップショットは保存されません</div>
+      {showHint && (
+        <div class="pcr-hint">
+          直したい箇所をクリック ／ 複数の要素はドラッグで囲む ／
+          Alt（Option）を押している間は通常操作
+        </div>
+      )}
+      {isRecording && (
+        <div class="pcr-hint">画面を記録しています…（このまま操作を続けられます）</div>
       )}
       {state.isIncognitoWarning && <div>⚠ シークレットウィンドウでは閉じると下書きが消えます</div>}
       {state.statusMessage !== null && <div class="pcr-status">{state.statusMessage}</div>}
     </div>
   );
+};
+
+const describeAnchorConfidence = (resolved: ResolvedAnchor): string => {
+  if (resolved.confidence === "fallback_rect") {
+    return `#${resolved.seq}：元の要素が見つからないため、記録したときの位置に表示しています`;
+  }
+  if (resolved.confidence === "selector_only") {
+    return `#${resolved.seq}：記録したときから文言が変わっています`;
+  }
+  return `#${resolved.seq} を編集`;
 };
 
 const extractEditorHighlightRect = (editor: DraftEditorState | null): Rect | null => {
@@ -506,9 +546,7 @@ const CanvasBoxes = ({
               left: `${resolved.rect.x - scrollX - 10}px`,
               top: `${resolved.rect.y - scrollY - 10}px`,
             }}
-            title={
-              resolved.confidence === "selector_only" ? "文言が変わっています" : `#${resolved.seq}`
-            }
+            title={describeAnchorConfidence(resolved)}
             onClick={() => onBadgeClick(resolved.seq)}
           >
             {resolved.seq}
@@ -597,23 +635,19 @@ export const OverlayApp = (props: OverlayAppProps): JSX.Element | null => {
           </button>
           <button
             type="button"
-            class="pcr-btn"
-            onClick={() => {
-              if (window.confirm("現在の下書きをすべて破棄して1番からやり直しますか？")) {
-                dispatch({ type: "RESET_ALL_CONFIRMED" });
-              }
-            }}
-          >
-            リセット
-          </button>
-          <button
-            type="button"
             class="pcr-btn pcr-btn-primary"
+            title="チケット用 Markdown をコピーし、HTML レポートを保存します"
+            disabled={state.items.length === 0}
             onClick={() => dispatch({ type: "REQUEST_COMPLETE" })}
           >
             完了
           </button>
-          <button type="button" class="pcr-btn" onClick={() => dispatch({ type: "CLOSE_TOOL" })}>
+          <button
+            type="button"
+            class="pcr-btn"
+            title="入力した変更は下書きとして残ります。もう一度ブックマークレットを押すと再開できます"
+            onClick={() => dispatch({ type: "CLOSE_TOOL" })}
+          >
             閉じる
           </button>
           {state.hasRecentCompletedDraft && state.items.length === 0 && (

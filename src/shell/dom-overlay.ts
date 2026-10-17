@@ -1,6 +1,8 @@
 import {
+  type TextIndexProvider,
   captureElementLocator,
   computeSmallestContainingElement,
+  createTextIndexProvider,
   extractFullElementText,
   extractImageSrc,
   findClosestLink,
@@ -9,6 +11,7 @@ import {
 } from "../core/anchor";
 import { HOST_ELEMENT_ID } from "../core/sanitize";
 import type {
+  AnchorMatchConfidence,
   DraftEditorState,
   ElementLocator,
   Item,
@@ -55,18 +58,30 @@ export const readPageMetaValues = (doc: Document): PageMetaValues => {
   };
 };
 
-const IMAGE_TAGS = new Set(["img", "picture", "video", "svg"]);
+const IMAGE_TAGS = new Set(["img", "picture", "video", "svg", "canvas"]);
+
+/**
+ * クリック位置の要素を、依頼の対象として自然な単位に寄せる。
+ * SVG アイコンの内部（path や g）を拾うと中身のない対象になるため、svg 要素全体を選ぶ。
+ */
+export const normalizePickTarget = (element: Element): Element => element.closest("svg") ?? element;
+
+const hasBackgroundImage = (doc: Document, element: Element): boolean => {
+  if (extractImageSrc(element) !== undefined) {
+    return true;
+  }
+  const computedBg = doc.defaultView?.getComputedStyle(element).backgroundImage ?? "";
+  return computedBg !== "none" && computedBg.includes("url(");
+};
 
 export const detectTargetKind = (doc: Document, element: Element): TargetKind => {
   const tag = element.tagName.toLowerCase();
   if (IMAGE_TAGS.has(tag)) {
     return "image";
   }
-  const computedBg = doc.defaultView?.getComputedStyle(element).backgroundImage ?? "";
-  if (
-    extractImageSrc(element) !== undefined ||
-    (computedBg !== "none" && computedBg.includes("url("))
-  ) {
+  // 背景画像つきのボタンや見出しでも、文字があれば文言を直せることを優先する
+  const hasText = extractFullElementText(doc, element).length > 0;
+  if (!hasText && hasBackgroundImage(doc, element)) {
     return "image";
   }
   if (findClosestLink(element) !== null) {
@@ -228,57 +243,113 @@ export const createEditorStateForPageMeta = (
   };
 };
 
-const resolveSingleItemAnchor = (
+export type AnchorTarget =
+  | {
+      readonly seq: number;
+      readonly kind: "element";
+      readonly element: Element | null;
+      readonly confidence: AnchorMatchConfidence;
+      readonly fallbackRect: Rect;
+    }
+  | {
+      readonly seq: number;
+      readonly kind: "region";
+      readonly container: Element | null;
+      readonly confidence: AnchorMatchConfidence;
+      readonly ratio: Rect;
+      readonly fallbackRect: Rect;
+    };
+
+const resolveLocatorOrNull = (
+  doc: Document,
+  locator: ElementLocator,
+  expectedAfterText: string | undefined,
+  getTextIndex: TextIndexProvider,
+): { readonly element: Element | null; readonly confidence: AnchorMatchConfidence } => {
+  const res = resolveElementLocator(doc, locator, expectedAfterText, getTextIndex);
+  return res.ok && res.value.element !== null
+    ? res.value
+    : { element: null, confidence: "fallback_rect" };
+};
+
+const resolveSingleAnchorTarget = (
   doc: Document,
   item: Item,
+  getTextIndex: TextIndexProvider,
   getResolvedTarget?: (seq: number) => ResolvedLiveTarget | undefined,
-): ResolvedAnchor | null => {
-  if (item.anchor.kind === "pageMeta") {
+): AnchorTarget | null => {
+  const { anchor } = item;
+  if (anchor.kind === "pageMeta") {
     return null;
   }
-  if (item.anchor.kind === "element") {
-    const cached = getResolvedTarget?.(item.seq);
-    if (cached !== undefined) {
-      return {
-        seq: item.seq,
-        rect: getElementPageRect(doc, cached.element),
-        confidence: cached.confidence,
-      };
-    }
-    const res = resolveElementLocator(doc, item.anchor.locator, item.after);
-    if (res.ok && res.value.element !== null) {
-      return {
-        seq: item.seq,
-        rect: getElementPageRect(doc, res.value.element),
-        confidence: res.value.confidence,
-      };
-    }
-    return {
-      seq: item.seq,
-      rect: item.anchor.rect,
-      confidence: "fallback_rect",
-    };
+  if (anchor.kind === "element") {
+    const resolved =
+      getResolvedTarget?.(item.seq) ??
+      resolveLocatorOrNull(doc, anchor.locator, item.after, getTextIndex);
+    return { seq: item.seq, kind: "element", ...resolved, fallbackRect: anchor.rect };
   }
-  const containerRes = resolveElementLocator(doc, item.anchor.container);
-  if (containerRes.ok && containerRes.value.element !== null) {
-    const cRect = getElementPageRect(doc, containerRes.value.element);
-    return {
-      seq: item.seq,
-      rect: {
-        x: Math.round(cRect.x + cRect.w * item.anchor.ratio.x),
-        y: Math.round(cRect.y + cRect.h * item.anchor.ratio.y),
-        w: Math.round(cRect.w * item.anchor.ratio.w),
-        h: Math.round(cRect.h * item.anchor.ratio.h),
-      },
-      confidence: containerRes.value.confidence,
-    };
-  }
+  const { element, confidence } = resolveLocatorOrNull(
+    doc,
+    anchor.container,
+    undefined,
+    getTextIndex,
+  );
   return {
     seq: item.seq,
-    rect: item.anchor.pageRect,
-    confidence: "fallback_rect",
+    kind: "region",
+    container: element,
+    confidence,
+    ratio: anchor.ratio,
+    fallbackRect: anchor.pageRect,
   };
 };
+
+/** DOM が変わったときだけ呼ぶ重い処理（要素の特定） */
+export const resolvePageAnchorTargets = (
+  doc: Document,
+  items: readonly Item[],
+  currentUrl: string,
+  getResolvedTarget?: (seq: number) => ResolvedLiveTarget | undefined,
+): readonly AnchorTarget[] => {
+  const getTextIndex = createTextIndexProvider(doc);
+  return items
+    .filter((i) => i.url === currentUrl)
+    .flatMap((item) => {
+      const target = resolveSingleAnchorTarget(doc, item, getTextIndex, getResolvedTarget);
+      return target !== null ? [target] : [];
+    });
+};
+
+/** スクロールやリサイズのたびに呼ぶ軽い処理（位置の計測だけ） */
+export const measureAnchorTargets = (
+  doc: Document,
+  targets: readonly AnchorTarget[],
+): readonly ResolvedAnchor[] =>
+  targets.map((target): ResolvedAnchor => {
+    if (target.kind === "element") {
+      return target.element?.isConnected
+        ? {
+            seq: target.seq,
+            rect: getElementPageRect(doc, target.element),
+            confidence: target.confidence,
+          }
+        : { seq: target.seq, rect: target.fallbackRect, confidence: "fallback_rect" };
+    }
+    if (target.container === null || !target.container.isConnected) {
+      return { seq: target.seq, rect: target.fallbackRect, confidence: "fallback_rect" };
+    }
+    const cRect = getElementPageRect(doc, target.container);
+    return {
+      seq: target.seq,
+      rect: {
+        x: Math.round(cRect.x + cRect.w * target.ratio.x),
+        y: Math.round(cRect.y + cRect.h * target.ratio.y),
+        w: Math.round(cRect.w * target.ratio.w),
+        h: Math.round(cRect.h * target.ratio.h),
+      },
+      confidence: target.confidence,
+    };
+  });
 
 export const resolvePageAnchors = (
   doc: Document,
@@ -286,12 +357,7 @@ export const resolvePageAnchors = (
   currentUrl: string,
   getResolvedTarget?: (seq: number) => ResolvedLiveTarget | undefined,
 ): readonly ResolvedAnchor[] =>
-  items
-    .filter((i) => i.url === currentUrl)
-    .flatMap((item) => {
-      const resolved = resolveSingleItemAnchor(doc, item, getResolvedTarget);
-      return resolved !== null ? [resolved] : [];
-    });
+  measureAnchorTargets(doc, resolvePageAnchorTargets(doc, items, currentUrl, getResolvedTarget));
 
 export const mountShadowHost = (
   doc: Document,

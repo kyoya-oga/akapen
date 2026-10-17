@@ -1,12 +1,33 @@
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { build } from "esbuild";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
+import { type Plugin, build, transform } from "esbuild";
 import { TOOL_VERSION } from "../src/core/types";
+import { VIEWER_CSS } from "../src/viewer/styles";
 
 const MAX_BUNDLE_BYTES = 100 * 1024;
 
 const computeSha256Base64 = (text: string): string =>
   createHash("sha256").update(text, "utf8").digest("base64");
+
+// レポート出力時にしか使わないビューアは gzip して埋め込み、ブックマークレット本体を小さく保つ
+const gzipToBase64 = (text: string): string =>
+  gzipSync(Buffer.from(text, "utf8"), { level: 9 }).toString("base64");
+
+const minifyCss = async (css: string): Promise<string> =>
+  (await transform(css, { loader: "css", minify: true })).code.trim();
+
+// UI の CSS はテンプレート文字列のため esbuild の minify が効かない。ビルド時に CSS として圧縮して差し込む
+const minifyOverlayCssPlugin: Plugin = {
+  name: "minify-overlay-css",
+  setup: (pluginBuild) => {
+    pluginBuild.onLoad({ filter: /[\\/]src[\\/]ui[\\/]styles\.ts$/ }, async () => {
+      const { OVERLAY_CSS } = await import("../src/ui/styles");
+      const minified = await minifyCss(OVERLAY_CSS);
+      return { contents: `export const OVERLAY_CSS = ${JSON.stringify(minified)};`, loader: "ts" };
+    });
+  },
+};
 
 const generateInstallHtml = (bookmarkletHref: string, bundleBytes: number): string => {
   const sizeKb = (bundleBytes / 1024).toFixed(1);
@@ -116,7 +137,7 @@ const generateInstallHtml = (bookmarkletHref: string, bundleBytes: number): stri
       </tr>
       <tr>
         <th>要素・セクションの削除</th>
-        <td>「この要素を削除」を押すと削除依頼になります。「<strong>外枠へ広げる ↑</strong>」（または <kbd>↑</kbd> / <kbd>↓</kbd> キー）で親ブロック単位に選択範囲を広げてから削除・メモ指示することも可能です。</td>
+        <td>「削除を依頼」を押すと削除依頼になります。「<strong>外枠へ広げる ↑</strong>」（または <kbd>↑</kbd> / <kbd>↓</kbd> キー）で親ブロック単位に選択範囲を広げてから削除・メモ指示することも可能です。</td>
       </tr>
       <tr>
         <th>範囲ドラッグ選択</th>
@@ -140,6 +161,23 @@ const generateInstallHtml = (bookmarkletHref: string, bundleBytes: number): stri
   <h2>更新履歴</h2>
   <ul>
     <li>
+      <strong>v0.3.0</strong>:
+      <ul>
+        <li>React などの SPA 上でも、ライブプレビューがページの再描画を壊さず、要素の作り直し後も自動で当て直すように変更</li>
+        <li>確定した変更が画面の記録を待たずに即座に一覧・バッジへ反映され、記録中はその旨を表示</li>
+        <li>エディタを開いたまま別の要素をクリックすると編集対象が切り替わるように（入力途中なら確認を表示）</li>
+        <li>背景画像つきのボタン・見出しでも文言を編集でき、SVG アイコンはアイコン全体を選択するように改善</li>
+        <li>ボタン名を「削除を依頼」「この変更を破棄」に変更。文言を空にして確定しても削除にはならず案内を表示</li>
+        <li>リセットを一覧内の「すべて破棄してやり直す」へ移動。操作ヒント・下書き復元の通知・バッジの状態説明を追加</li>
+        <li>Mac で Option+クリックしたリンクがダウンロードされてしまう問題を修正</li>
+        <li>チケット・レポート・画面の番号を #番号 に統一し、AI 向け作業指示の文言を原文のままコードブロックで出力</li>
+        <li>外部 CSS・CSS-in-JS のスタイルをレポートに埋め込み、レポートを開いても外部へ一切通信しないよう CSP を強化</li>
+        <li>取り消した変更のスナップショット・画像をレポートと下書きから除外</li>
+        <li>文脈検索の高速化、スクロール時の再計算削減、スナップショットの使い回し、下書き保存の差分化、レポートの小型化</li>
+        <li>個人情報ページ（/mypage など）でスナップショットを撮らない機能を廃止</li>
+      </ul>
+    </li>
+    <li>
       <strong>v0.2.0</strong>:
       <ul>
         <li>ライブプレビュー適用後のアンカー位置維持・同一要素再クリック時の再編集対応</li>
@@ -158,7 +196,21 @@ const generateInstallHtml = (bookmarkletHref: string, bundleBytes: number): stri
 </html>`;
 };
 
-const runBuild = async (): Promise<void> => {
+const EMBEDDED_BUNDLE_PATH = "./src/viewer/embedded-bundle.ts";
+
+// 内容が同じなら書き換えない（pretest / pretypecheck のたびにファイルの更新日時が変わらないように）
+const writeFileIfChanged = async (path: string, content: string): Promise<void> => {
+  const current = await readFile(path, "utf8").catch(() => null);
+  if (current !== content) {
+    await writeFile(path, content, "utf8");
+  }
+};
+
+/**
+ * レポート用ビューアをビルドし、本体が import する src/viewer/embedded-bundle.ts を生成する。
+ * 生成物は git 管理外のため、型検査・テストの前にも実行する（npm run generate:viewer）
+ */
+const generateEmbeddedViewer = async (): Promise<void> => {
   const viewerResult = await build({
     entryPoints: ["./src/viewer/index.ts"],
     bundle: true,
@@ -178,12 +230,17 @@ const runBuild = async (): Promise<void> => {
   const viewerHash = computeSha256Base64(viewerCode);
 
   const embeddedSource = [
-    `export const EMBEDDED_VIEWER_SCRIPT = ${JSON.stringify(viewerCode)};`,
+    `export const EMBEDDED_VIEWER_SCRIPT_GZIP_BASE64 = ${JSON.stringify(gzipToBase64(viewerCode))};`,
     `export const EMBEDDED_VIEWER_SHA256_BASE64 = ${JSON.stringify(viewerHash)};`,
+    `export const EMBEDDED_VIEWER_CSS_GZIP_BASE64 = ${JSON.stringify(gzipToBase64(await minifyCss(VIEWER_CSS)))};`,
     "",
   ].join("\n");
 
-  await writeFile("./src/viewer/embedded-bundle.ts", embeddedSource, "utf8");
+  await writeFileIfChanged(EMBEDDED_BUNDLE_PATH, embeddedSource);
+};
+
+const runBuild = async (): Promise<void> => {
+  await generateEmbeddedViewer();
 
   const mainResult = await build({
     entryPoints: ["./src/index.ts"],
@@ -194,6 +251,7 @@ const runBuild = async (): Promise<void> => {
     minify: true,
     jsx: "automatic",
     jsxImportSource: "preact",
+    plugins: [minifyOverlayCssPlugin],
     write: false,
   });
 
@@ -220,4 +278,8 @@ const runBuild = async (): Promise<void> => {
   await writeFile("./install.html", installHtml, "utf8");
 };
 
-await runBuild();
+if (process.argv.includes("--viewer-only")) {
+  await generateEmbeddedViewer();
+} else {
+  await runBuild();
+}

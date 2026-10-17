@@ -5,6 +5,7 @@ import {
   isStableIdName,
   resolveElementLocator,
 } from "../src/core/anchor";
+import { detectTargetKind, normalizePickTarget } from "../src/shell/dom-overlay";
 import { createTestDocument, mustQuery } from "./helpers";
 
 describe("アンカーの捕捉と別ビルド後の箇所の復元", () => {
@@ -89,5 +90,40 @@ describe("アンカーの捕捉と別ビルド後の箇所の復元", () => {
       expect(resolved.value.confidence).toBe("selector_only");
       expect(resolved.value.element).toBe(titleEl);
     }
+  });
+});
+
+describe("クリックした要素の扱い", () => {
+  test("SVG アイコンの内部をクリックしても、アイコン全体が画像として選ばれる", () => {
+    const doc = createTestDocument(
+      '<html><body><button><svg id="icon"><g><path id="p" d="M0 0h1v1z"></path></g></svg>保存</button></body></html>',
+    );
+    const path = doc.getElementById("p") as Element;
+
+    const picked = normalizePickTarget(path);
+
+    expect(picked.id).toBe("icon");
+    expect(detectTargetKind(doc, picked)).toBe("image");
+  });
+
+  test("背景画像つきでも文字がある要素は文言の編集対象になり、文字の無い背景画像要素は画像の差し替え対象になる", () => {
+    const doc = createTestDocument(
+      `<html><body>
+        <a id="cta" href="/buy" style="background-image:url('/img/arrow.png')">購入する</a>
+        <div id="banner" style="background-image:url('/img/banner.png')"></div>
+      </body></html>`,
+    );
+
+    expect(detectTargetKind(doc, doc.getElementById("cta") as Element)).toBe("link");
+    expect(detectTargetKind(doc, doc.getElementById("banner") as Element)).toBe("image");
+  });
+
+  test("CSS-in-JS が生成する乱数クラス名はセレクタに使わない", () => {
+    expect(isStableClassName("css-1x2y3z")).toBe(false);
+    expect(isStableClassName("sc-bdVaJa")).toBe(false);
+    expect(isStableClassName("kXbTqG")).toBe(false);
+    expect(isStableClassName("jsx-2385271")).toBe(false);
+    expect(isStableClassName("product-title")).toBe(true);
+    expect(isStableClassName("btn")).toBe(true);
   });
 });

@@ -43,11 +43,6 @@ const evaluateTextChange = (
   if (isDeleteRequested) {
     return "DELETE";
   }
-  const trimmedCurrent = currentText.trim();
-  const trimmedInitial = initialText.trim();
-  if (trimmedInitial.length > 0 && trimmedCurrent.length === 0) {
-    return "DELETE";
-  }
   if (currentText !== initialText) {
     return "TEXT_REPLACE";
   }
@@ -66,11 +61,6 @@ const evaluateLinkChange = (
   isDeleteRequested: boolean,
 ): ChangeType | null => {
   if (isDeleteRequested) {
-    return "DELETE";
-  }
-  const trimmedCurrent = currentText.trim();
-  const trimmedInitial = initialText.trim();
-  if (trimmedInitial.length > 0 && trimmedCurrent.length === 0) {
     return "DELETE";
   }
   const textChanged = currentText !== initialText;

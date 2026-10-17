@@ -10,6 +10,7 @@ export {
   decompressGzipBase64ToString,
   uint8ArrayToBase64,
 };
+import { computeDomPath, resolveDomPath } from "../core/dom-path";
 import { type Result, err, ok } from "../core/result";
 import {
   collectImageUrlsFromClonedRoot,
@@ -17,6 +18,7 @@ import {
   rewriteCssUrlsToAbsolute,
   sanitizeClonedDocument,
   syncLiveDomStateBeforeClone,
+  toAbsoluteUrl,
 } from "../core/sanitize";
 import type { AttachmentMeta, SnapshotMeta } from "../core/types";
 
@@ -38,8 +40,9 @@ export type CapturedSnapshotData = {
   readonly newResources: readonly ResourceEntry[];
 };
 
-import { sha256HexSync } from "../core/sha256";
+import { fastHashHex } from "../core/fast-hash";
 
+// 画像・スナップショットの内容ハッシュ。HTTPS では SHA-256、使えない環境では軽量ハッシュで代用する
 export const computeSha256Hex = async (bytes: Uint8Array): Promise<string> => {
   if (typeof crypto !== "undefined" && crypto.subtle !== undefined) {
     try {
@@ -47,10 +50,10 @@ export const computeSha256Hex = async (bytes: Uint8Array): Promise<string> => {
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
     } catch {
-      return sha256HexSync(bytes);
+      return fastHashHex(bytes);
     }
   }
-  return sha256HexSync(bytes);
+  return fastHashHex(bytes);
 };
 
 const replaceCanvasesWithImages = (liveRoot: Element, cloneRoot: Element): void => {
@@ -77,27 +80,143 @@ const replaceCanvasesWithImages = (liveRoot: Element, cloneRoot: Element): void 
   });
 };
 
-const extractDynamicStyles = (doc: Document, baseUrl: string): string => {
-  const sheetRules = Array.from(doc.styleSheets).flatMap((sheet) => {
-    if (sheet.href !== null) {
-      return [];
-    }
+const CSS_IMPORT_RULE = 3;
+const MAX_IMPORT_DEPTH = 4;
+
+// CSS-in-JS（emotion / styled-components など）は insertRule でルールを入れるため
+// <style> の textContent が空のことが多い。CSSOM から直列化して取り込む
+const serializeSheetRules = (sheet: CSSStyleSheet, baseUrl: string, depth = 0): string | null => {
+  const rules = ((): readonly CSSRule[] | null => {
     try {
-      return Array.from(sheet.cssRules).map((r) => r.cssText);
+      return Array.from(sheet.cssRules);
     } catch {
-      return [];
+      return null;
     }
-  });
-  const adoptedRules = (doc.adoptedStyleSheets ?? []).flatMap((sheet) => {
-    try {
-      return Array.from(sheet.cssRules).map((r) => r.cssText);
-    } catch {
-      return [];
-    }
-  });
-  const combined = [...sheetRules, ...adoptedRules].join("\n");
-  return rewriteCssUrlsToAbsolute(combined, baseUrl);
+  })();
+  if (rules === null) {
+    return null;
+  }
+  const sheetBase = sheet.href ?? baseUrl;
+  return rules
+    .map((rule) =>
+      rule.type === CSS_IMPORT_RULE
+        ? serializeImportRule(rule as CSSImportRule, sheetBase, depth)
+        : rewriteCssUrlsToAbsolute(rule.cssText, sheetBase),
+    )
+    .join("\n");
 };
+
+// @import 先も読めれば中身を展開する（読めないものは CSP で読み込めないので捨てる）
+const serializeImportRule = (rule: CSSImportRule, baseUrl: string, depth: number): string => {
+  const imported = rule.styleSheet;
+  if (imported === null || depth >= MAX_IMPORT_DEPTH) {
+    return "";
+  }
+  const inner = serializeSheetRules(imported, baseUrl, depth + 1);
+  return inner === null ? "" : wrapWithMedia(inner, rule.media?.mediaText ?? "");
+};
+
+const extractAdoptedStyles = (doc: Document, baseUrl: string): string =>
+  (doc.adoptedStyleSheets ?? [])
+    .flatMap((sheet) => {
+      const css = serializeSheetRules(sheet, baseUrl);
+      return css !== null ? [css] : [];
+    })
+    .join("\n");
+
+const cssTextCache = new Map<string, string>();
+
+// <link crossorigin> が無いと CORS 許可された CDN の CSS でも cssRules を読めないため、取得し直す
+const fetchStylesheetText = async (href: string): Promise<string | null> => {
+  const cached = cssTextCache.get(href);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(href, { credentials: "same-origin", signal: controller.signal });
+    if (!resp.ok) {
+      return null;
+    }
+    const text = rewriteCssUrlsToAbsolute(await resp.text(), href);
+    cssTextCache.set(href, text);
+    return text;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timerId);
+  }
+};
+
+type StyleSource = {
+  readonly cloneEl: Element;
+  readonly sheet: CSSStyleSheet;
+};
+
+const pairLiveStyleSheetsWithClone = (
+  liveDoc: Document,
+  cloneRoot: Element,
+): readonly StyleSource[] =>
+  Array.from(liveDoc.styleSheets).flatMap((sheet) => {
+    const owner = sheet.ownerNode;
+    if (owner === null || !(owner as Element).tagName || sheet.disabled) {
+      return [];
+    }
+    const cloneEl = resolveDomPath(
+      cloneRoot,
+      computeDomPath(liveDoc.documentElement, owner as Element),
+    );
+    return cloneEl !== null && cloneEl.tagName === (owner as Element).tagName
+      ? [{ cloneEl, sheet: sheet as CSSStyleSheet }]
+      : [];
+  });
+
+const wrapWithMedia = (css: string, media: string): string =>
+  media.length > 0 && media !== "all" ? `@media ${media}{${css}}` : css;
+
+/**
+ * 外部 CSS を <style> として埋め込み、レポートを開いたときに元サイトへ通信しないようにする。
+ * 埋め込めなかった <link> は CSP で読み込めないため取り除く（domPath がずれないよう template に置換）
+ */
+const inlineStylesheets = async (
+  cloneDoc: Document,
+  sources: readonly StyleSource[],
+  baseUrl: string,
+): Promise<void> => {
+  await Promise.all(
+    sources.map(async ({ cloneEl, sheet }) => {
+      const isLink = cloneEl.tagName.toLowerCase() === "link";
+      const serialized = serializeSheetRules(sheet, baseUrl);
+      const css =
+        serialized ??
+        (isLink && sheet.href !== null
+          ? await fetchStylesheetText(toAbsoluteUrl(sheet.href, baseUrl))
+          : null);
+      if (css === null) {
+        return;
+      }
+      if (!isLink) {
+        cloneEl.textContent = css;
+        return;
+      }
+      const styleEl = cloneDoc.createElement("style");
+      styleEl.setAttribute("data-pcr-inlined-from", sheet.href ?? "");
+      styleEl.textContent = wrapWithMedia(css, cloneEl.getAttribute("media") ?? "");
+      cloneEl.replaceWith(styleEl);
+    }),
+  );
+  Array.from(cloneDoc.querySelectorAll("link")).map((link) => {
+    const tmpl = cloneDoc.createElement("template");
+    tmpl.setAttribute("data-pcr-removed", "link");
+    link.replaceWith(tmpl);
+  });
+};
+
+const collectReferencedResourceHashes = (html: string): readonly string[] =>
+  Array.from(new Set(Array.from(html.matchAll(/pcr-res:([a-f0-9]+)/g), (m) => m[1] ?? ""))).filter(
+    (h) => h.length > 0,
+  );
 
 const urlResourceCache = new Map<string, ResourceEntry>();
 
@@ -205,23 +324,25 @@ export const captureCleanSnapshot = async (
   };
   const title = liveDoc.title || "無題のページ";
 
-  const clonedDoc = withCleanDom(() => {
+  const { clonedDoc, styleSources } = withCleanDom(() => {
     const parser = new DOMParser();
     const docCopy = parser.parseFromString("<!doctype html><html></html>", "text/html");
     const clonedHtml = liveDoc.documentElement.cloneNode(true) as Element;
     syncLiveDomStateBeforeClone(liveDoc.documentElement, clonedHtml);
+    const sources = pairLiveStyleSheetsWithClone(liveDoc, clonedHtml);
     replaceCanvasesWithImages(liveDoc.documentElement, clonedHtml);
     docCopy.replaceChild(clonedHtml, docCopy.documentElement);
-    return docCopy;
+    return { clonedDoc: docCopy, styleSources: sources };
   });
 
   sanitizeClonedDocument(clonedDoc, baseUrl);
+  await inlineStylesheets(clonedDoc, styleSources, baseUrl);
 
-  const dynamicCss = extractDynamicStyles(liveDoc, baseUrl);
-  if (dynamicCss.trim().length > 0 && clonedDoc.head !== null) {
+  const adoptedCss = extractAdoptedStyles(liveDoc, baseUrl);
+  if (adoptedCss.trim().length > 0 && clonedDoc.head !== null) {
     const styleEl = clonedDoc.createElement("style");
     styleEl.setAttribute("data-pcr-dynamic-styles", "true");
-    styleEl.textContent = dynamicCss;
+    styleEl.textContent = adoptedCss;
     clonedDoc.head.appendChild(styleEl);
   }
 
@@ -243,6 +364,7 @@ export const captureCleanSnapshot = async (
     viewport,
     scroll,
     capturedAt: new Date().toISOString(),
+    resourceHashes: collectReferencedResourceHashes(serializedHtml),
   };
 
   return {

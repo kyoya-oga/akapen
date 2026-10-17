@@ -18,11 +18,26 @@ export type HydratedStorageBundle = {
   readonly resources: Readonly<Record<string, ResourceEntry>>;
 };
 
+const dbCache: {
+  factory: IDBFactory | null;
+  promise: Promise<IDBDatabase | null> | null;
+} = { factory: null, promise: null };
+
+const resetDbCache = (): void => {
+  dbCache.factory = null;
+  dbCache.promise = null;
+};
+
+// 保存のたびに接続を開き直すと閉じられない接続が溜まるため、1 本を使い回す
 const openDatabase = (): Promise<IDBDatabase | null> => {
-  if (typeof indexedDB === "undefined") {
+  if (typeof indexedDB === "undefined" || indexedDB === null) {
     return Promise.resolve(null);
   }
-  return new Promise((resolve) => {
+  if (dbCache.promise !== null && dbCache.factory === indexedDB) {
+    return dbCache.promise;
+  }
+  dbCache.factory = indexedDB;
+  dbCache.promise = new Promise((resolve) => {
     try {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
@@ -37,12 +52,25 @@ const openDatabase = (): Promise<IDBDatabase | null> => {
           db.createObjectStore(STORE_RESOURCES, { keyPath: "hash" });
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          db.close();
+          resetDbCache();
+        };
+        db.onclose = resetDbCache;
+        resolve(db);
+      };
+      req.onerror = () => {
+        resetDbCache();
+        resolve(null);
+      };
     } catch {
+      resetDbCache();
       resolve(null);
     }
   });
+  return dbCache.promise;
 };
 
 const idbGetAll = <T>(db: IDBDatabase, storeName: string): Promise<readonly T[]> =>
@@ -149,6 +177,55 @@ export const loadInitialStorageBundle = async (
   };
 };
 
+type ReferencedAssetKeys = {
+  readonly snapshotIds: ReadonlySet<string>;
+  /** null のときは参照の分からない古いスナップショットがあるため、リソースを消さない */
+  readonly resourceHashes: ReadonlySet<string> | null;
+};
+
+export const collectReferencedAssetKeys = (
+  drafts: readonly (DraftRecord | undefined)[],
+): ReferencedAssetKeys => {
+  const present = drafts.flatMap((d) => (d !== undefined ? [d] : []));
+  const snapshotIds = new Set(
+    present.flatMap((d) =>
+      d.items.flatMap((i) => (i.snapshotId !== undefined ? [i.snapshotId] : [])),
+    ),
+  );
+  const attachmentIds = new Set(present.flatMap((d) => d.items.flatMap((i) => i.attachmentIds)));
+  const snapshots = present.flatMap((d) => d.snapshots.filter((s) => snapshotIds.has(s.id)));
+  if (snapshots.some((s) => s.resourceHashes === undefined)) {
+    return { snapshotIds, resourceHashes: null };
+  }
+  const resourceHashes = new Set([
+    ...snapshots.flatMap((s) => s.resourceHashes ?? []),
+    ...present.flatMap((d) =>
+      d.attachments.filter((a) => attachmentIds.has(a.id)).map((a) => a.resourceHash),
+    ),
+  ]);
+  return { snapshotIds, resourceHashes };
+};
+
+// 既にあるキーは書き直さず（中身はハッシュで決まるので不変）、参照されなくなったキーは消す
+const syncStoreEntries = (
+  store: IDBObjectStore,
+  wanted: ReadonlyMap<string, unknown>,
+  keep: ReadonlySet<string> | null,
+): void => {
+  const keysReq = store.getAllKeys();
+  keysReq.onsuccess = () => {
+    const existing = new Set((keysReq.result as readonly IDBValidKey[]).map(String));
+    Array.from(wanted.entries())
+      .filter(([key]) => !existing.has(key) && (keep === null || keep.has(key)))
+      .map(([, value]) => store.put(value));
+    if (keep !== null) {
+      Array.from(existing)
+        .filter((key) => !keep.has(key))
+        .map((key) => store.delete(key));
+    }
+  };
+};
+
 export const saveDraftAndAssetsToDb = async (
   draft: DraftRecord,
   snapshotBodies: Readonly<Record<string, string>>,
@@ -158,16 +235,37 @@ export const saveDraftAndAssetsToDb = async (
   if (db === null) {
     return false;
   }
-  const draftSaved = await idbPut(db, STORE_DRAFTS, draft);
-  const bodyResults = await Promise.all(
-    Object.entries(snapshotBodies).map(([id, base64]) =>
-      idbPut(db, STORE_SNAPSHOT_BODIES, { id, base64 }),
-    ),
-  );
-  const resourceResults = await Promise.all(
-    Object.values(resources).map((res) => idbPut(db, STORE_RESOURCES, res)),
-  );
-  return [draftSaved, ...bodyResults, ...resourceResults].every((saved) => saved);
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(
+        [STORE_DRAFTS, STORE_SNAPSHOT_BODIES, STORE_RESOURCES],
+        "readwrite",
+      );
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+      const draftStore = tx.objectStore(STORE_DRAFTS);
+      draftStore.put(draft);
+      // 「前回の続き」用の完了済み下書きが参照しているデータは消さない
+      const completedReq = draftStore.get("completed");
+      completedReq.onsuccess = () => {
+        const completed = completedReq.result as DraftRecord | undefined;
+        const keys = collectReferencedAssetKeys([draft, completed]);
+        syncStoreEntries(
+          tx.objectStore(STORE_SNAPSHOT_BODIES),
+          new Map(Object.entries(snapshotBodies).map(([id, base64]) => [id, { id, base64 }])),
+          keys.snapshotIds,
+        );
+        syncStoreEntries(
+          tx.objectStore(STORE_RESOURCES),
+          new Map(Object.entries(resources)),
+          keys.resourceHashes,
+        );
+      };
+    } catch {
+      resolve(false);
+    }
+  });
 };
 
 export const markDraftAsCompletedInDb = async (draft: DraftRecord): Promise<void> => {

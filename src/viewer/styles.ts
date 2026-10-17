@@ -153,6 +153,12 @@ body {
   border-color: #2563eb;
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
 }
+.v-card-url {
+  font-size: 11px;
+  color: #64748b;
+  margin: 2px 0 6px;
+  word-break: break-all;
+}
 .v-card-head {
   display: flex;
   align-items: center;

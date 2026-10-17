@@ -5,6 +5,7 @@ import {
   resolveDomPath,
   resolveElementLocator,
 } from "../src/core/anchor";
+import { fastHashHex } from "../src/core/fast-hash";
 import { isConfirmEnter } from "../src/core/keyboard";
 import { applyPreviewToClonedDocument, computeCharDiff } from "../src/core/preview";
 import { sanitizeClonedDocument } from "../src/core/sanitize";
@@ -120,7 +121,7 @@ describe("リンク先 URL の検証", () => {
       hasChildFormatting: false,
       popoverRect: { x: 0, y: 0, w: 10, h: 10 },
     };
-    const opened = update(createInitialState("https://shop.example.com/", false), {
+    const opened = update(createInitialState("https://shop.example.com/"), {
       type: "OPEN_EDITOR",
       editor,
     });
@@ -152,14 +153,14 @@ describe("リンク先 URL の検証", () => {
       hasChildFormatting: false,
       popoverRect: { x: 0, y: 0, w: 10, h: 10 },
     };
-    const opened = update(createInitialState("https://shop.example.com/", false), {
+    const opened = update(createInitialState("https://shop.example.com/"), {
       type: "OPEN_EDITOR",
       editor,
     });
 
     const result = update(opened.state, { type: "CONFIRM_EDITOR" });
 
-    expect(result.effects[0]?.type).toBe("CAPTURE_SNAPSHOT_AND_COMMIT_ITEM");
+    expect(result.state.items.map((i) => i.after)).toEqual(["閉じる"]);
   });
 
   test("下書きやレポートに javascript: のリンク先が紛れ込んでいても、プレビューの href には適用されない", () => {
@@ -236,7 +237,7 @@ describe("書き出す HTML レポートの安全性", () => {
     expect(JSON.parse(escaped)).toEqual({ t: "</script><!--<script>alert(1)</script>" });
   });
 
-  test("CSP で <base> の差し替えとフォーム送信が禁止され、外部通信は画像・CSS 以外に許可されない", () => {
+  test("CSP で <base> の差し替えとフォーム送信が禁止され、レポートを開いても外部へは一切通信しない", () => {
     const html = buildReportHtmlString({
       pageTitle: "t",
       doc: {
@@ -259,12 +260,15 @@ describe("書き出す HTML レポートの安全性", () => {
     expect(html).toContain("base-uri 'none'");
     expect(html).toContain("form-action 'none'");
     expect(html).toContain("script-src 'sha256-HASH'");
+    const csp = /http-equiv="Content-Security-Policy" content="([^"]*)"/.exec(html)?.[1] ?? "";
+    expect(csp).toContain("img-src data: blob:");
+    expect(csp).not.toContain("https:");
   });
 });
 
 describe("操作の失敗がユーザーに通知される", () => {
   test("失敗イベントを受け取ると、ステータスメッセージとして表示される", () => {
-    const state = createInitialState("https://shop.example.com/", false);
+    const state = createInitialState("https://shop.example.com/");
 
     const result = update(state, {
       type: "OPERATION_FAILED",
@@ -436,7 +440,7 @@ describe("ライブプレビュー・エディタ・エクスポートの整合�
       hasChildFormatting: false,
       popoverRect: { x: 0, y: 0, w: 10, h: 10 },
     });
-    const s0 = createInitialState("https://shop.example.com/", false);
+    const s0 = createInitialState("https://shop.example.com/");
     const s1 = update(update(s0, { type: "OPEN_EDITOR", editor: makeEditor("新1") }).state, {
       type: "CONFIRM_EDITOR",
     });
@@ -444,10 +448,11 @@ describe("ライブプレビュー・エディタ・エクスポートの整合�
       type: "CONFIRM_EDITOR",
     });
 
-    const eff1 = s1.effects[0];
-    const eff2 = s2.effects[0];
-    expect(eff1?.type === "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM" && eff1.pendingItem.seq).toBe(1);
-    expect(eff2?.type === "CAPTURE_SNAPSHOT_AND_COMMIT_ITEM" && eff2.pendingItem.seq).toBe(2);
+    const captureSeqs = [...s1.effects, ...s2.effects].flatMap((e) =>
+      e.type === "CAPTURE_SNAPSHOT_FOR_ITEM" ? [e.item.seq] : [],
+    );
+    expect(captureSeqs).toEqual([1, 2]);
+    expect(s2.state.items.map((i) => i.seq)).toEqual([1, 2]);
   });
 
   test("レポート出力時は現在の変更項目から参照されているスナップショットと添付画像だけが出力される", () => {
@@ -464,6 +469,7 @@ describe("ライブプレビュー・エディタ・エクスポートの整合�
           viewport: { w: 1280, h: 800 },
           scroll: { x: 0, y: 0 },
           capturedAt: "2026-01-01T00:00:00.000Z",
+          resourceHashes: ["r-snap"],
         },
         {
           id: "snap-orphan",
@@ -472,6 +478,7 @@ describe("ライブプレビュー・エディタ・エクスポートの整合�
           viewport: { w: 1280, h: 800 },
           scroll: { x: 0, y: 0 },
           capturedAt: "2026-01-01T00:00:00.000Z",
+          resourceHashes: ["r-orphan"],
         },
       ],
       items: [
@@ -494,15 +501,21 @@ describe("ライブプレビュー・エディタ・エクスポートの整合�
       ["snap-orphan", "BODY_ORPHAN"],
     ]);
 
-    const { filteredDoc, filteredSnapshotBodies } = filterReferencedReportAssets(
+    const resource = (hash: string) => ({ hash, mime: "image/webp", base64: "AA", byteLength: 1 });
+    const resources = new Map(
+      ["h1", "h2", "r-snap", "r-orphan"].map((hash) => [hash, resource(hash)] as const),
+    );
+
+    const { filteredDoc, filteredSnapshotBodies, filteredResources } = filterReferencedReportAssets(
       rawDoc,
       bodies,
-      new Map(),
+      resources,
     );
 
     expect(filteredDoc.snapshots.map((s) => s.id)).toEqual(["snap-used"]);
     expect(filteredDoc.attachments.map((a) => a.id)).toEqual(["att-used"]);
     expect(Object.keys(filteredSnapshotBodies)).toEqual(["snap-used"]);
+    expect(Object.keys(filteredResources).sort()).toEqual(["h1", "r-snap"]);
   });
 });
 
@@ -543,43 +556,71 @@ describe("ツール内のキー入力がサイトのショートカットに漏�
 });
 
 type FakeTxOutcome = "complete" | "abort" | "error";
+type FakeStores = Record<string, Map<string, unknown>>;
 
-const stubIndexedDb = (outcome: FakeTxOutcome): void => {
+const STORE_KEY_PATHS: Readonly<Record<string, string>> = {
+  drafts: "id",
+  snapshotBodies: "id",
+  resources: "hash",
+};
+
+const fakeRequest = (result: unknown): { result: unknown; onsuccess: (() => void) | null } => {
+  const req: { result: unknown; onsuccess: (() => void) | null } = { result, onsuccess: null };
+  setTimeout(() => req.onsuccess?.(), 0);
+  return req;
+};
+
+const stubIndexedDb = (outcome: FakeTxOutcome, stores: FakeStores = {}): FakeStores => {
+  const getStore = (name: string): Map<string, unknown> => {
+    const existing = stores[name];
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created = new Map<string, unknown>();
+    stores[name] = created;
+    return created;
+  };
   const fakeDb = {
     objectStoreNames: { contains: () => true },
+    close: () => undefined,
     transaction: () => {
       const tx: {
         oncomplete: (() => void) | null;
         onerror: (() => void) | null;
         onabort: (() => void) | null;
-        objectStore: () => { put: () => void };
+        objectStore: (name: string) => unknown;
       } = {
         oncomplete: null,
         onerror: null,
         onabort: null,
-        objectStore: () => ({
-          put: () =>
-            setTimeout(() => {
-              const handler = { complete: tx.oncomplete, abort: tx.onabort, error: tx.onerror }[
-                outcome
-              ];
-              handler?.();
-            }, 0),
-        }),
+        objectStore: (name: string) => {
+          const store = getStore(name);
+          return {
+            put: (value: Record<string, unknown>) => {
+              store.set(String(value[STORE_KEY_PATHS[name] ?? "id"]), value);
+              return fakeRequest(undefined);
+            },
+            get: (key: string) => fakeRequest(store.get(key)),
+            getAll: () => fakeRequest(Array.from(store.values())),
+            getAllKeys: () => fakeRequest(Array.from(store.keys())),
+            delete: (key: string) => {
+              store.delete(key);
+              return fakeRequest(undefined);
+            },
+          };
+        },
       };
+      setTimeout(() => {
+        const handler = { complete: tx.oncomplete, abort: tx.onabort, error: tx.onerror }[outcome];
+        handler?.();
+      }, 20);
       return tx;
     },
   };
   vi.stubGlobal("indexedDB", {
-    open: () => {
-      const req: { result: unknown; onsuccess: (() => void) | null } = {
-        result: fakeDb,
-        onsuccess: null,
-      };
-      setTimeout(() => req.onsuccess?.(), 0);
-      return req;
-    },
+    open: () => fakeRequest(fakeDb),
   });
+  return stores;
 };
 
 describe("下書きの保存結果", () => {
@@ -618,5 +659,79 @@ describe("下書きの保存結果", () => {
     vi.stubGlobal("indexedDB", undefined);
 
     await expect(saveDraftAndAssetsToDb(draft, {}, {})).resolves.toBe(false);
+  });
+
+  test("保存のたびに全件を書き直さず、どの下書きからも参照されないスナップショットと画像は消し、前回完了分の参照は残す", async () => {
+    const snapshot = (id: string, resourceHashes: readonly string[]) => ({
+      id,
+      url: "https://shop.example.com/",
+      title: "t",
+      viewport: { w: 1280, h: 800 },
+      scroll: { x: 0, y: 0 },
+      capturedAt: "2026-01-01T00:00:00.000Z",
+      resourceHashes,
+    });
+    const item = (seq: number, snapshotId: string) => ({
+      seq,
+      url: "https://shop.example.com/",
+      snapshotId,
+      anchor: { kind: "pageMeta" as const },
+      changeType: "PAGE_META" as const,
+      attachmentIds: [],
+    });
+    const resource = (hash: string) => ({ hash, mime: "image/png", base64: "AA", byteLength: 1 });
+    const stores = stubIndexedDb("complete", {
+      drafts: new Map<string, unknown>([
+        [
+          "completed",
+          {
+            ...draft,
+            id: "completed",
+            items: [item(1, "snap-c")],
+            snapshots: [snapshot("snap-c", ["r2"])],
+          },
+        ],
+      ]),
+      snapshotBodies: new Map<string, unknown>([
+        ["snap-old", { id: "snap-old", base64: "OLD" }],
+        ["snap-c", { id: "snap-c", base64: "C" }],
+      ]),
+      resources: new Map<string, unknown>([
+        ["r2", resource("r2")],
+        ["r-old", resource("r-old")],
+      ]),
+    });
+
+    const saved = await saveDraftAndAssetsToDb(
+      { ...draft, items: [item(1, "snap-a")], snapshots: [snapshot("snap-a", ["r1"])] },
+      { "snap-a": "A", "snap-old": "OLD" },
+      { r1: resource("r1"), "r-unused": resource("r-unused") },
+    );
+
+    const { snapshotBodies, resources } = stores;
+    expect(saved).toBe(true);
+    expect(Array.from(snapshotBodies?.keys() ?? []).sort()).toEqual(["snap-a", "snap-c"]);
+    expect(Array.from(resources?.keys() ?? []).sort()).toEqual(["r1", "r2"]);
+  });
+});
+
+describe("http:// 環境向けの予備ハッシュ", () => {
+  test("同じ内容は同じ 16 桁の16進ハッシュになり、1 バイト違うだけでも別のハッシュになる", () => {
+    const bytes = new TextEncoder().encode("同じ画像のバイト列");
+    const changed = new Uint8Array(bytes);
+    changed[0] = (changed[0] ?? 0) ^ 1;
+
+    expect(fastHashHex(bytes)).toMatch(/^[0-9a-f]{16}$/);
+    expect(fastHashHex(new Uint8Array(bytes))).toBe(fastHashHex(bytes));
+    expect(fastHashHex(changed)).not.toBe(fastHashHex(bytes));
+    expect(fastHashHex(new Uint8Array(0))).not.toBe(fastHashHex(new Uint8Array(1)));
+  });
+
+  test("1 万件の異なる入力でハッシュが衝突しない", () => {
+    const hashes = new Set(
+      Array.from({ length: 10000 }, (_, i) => fastHashHex(new TextEncoder().encode(`img-${i}`))),
+    );
+
+    expect(hashes.size).toBe(10000);
   });
 });

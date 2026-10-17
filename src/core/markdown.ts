@@ -59,7 +59,7 @@ export const formatPageMetaFieldLabel = (field: PageMetaField): string => {
   }
 };
 
-const extractPathname = (urlStr: string): string => {
+export const extractPathname = (urlStr: string): string => {
   try {
     const parsed = new URL(urlStr, "https://example.com");
     return `${parsed.pathname}${parsed.search}${parsed.hash}` || "/";
@@ -68,46 +68,46 @@ const extractPathname = (urlStr: string): string => {
   }
 };
 
+// 番号は画面上のバッジ・レポートのカードと同じ #seq を使う（削除で欠番があっても対応が取れるように）
 const formatTicketItemHeader = (
   item: Item,
-  index: number,
   snapshotsById: Readonly<Record<string, SnapshotMeta>>,
 ): string => {
   const label = formatChangeTypeLabel(item.changeType);
   const path = extractPathname(item.url);
   const snap = item.snapshotId !== undefined ? snapshotsById[item.snapshotId] : undefined;
   const widthPart = snap !== undefined ? `、幅 ${snap.viewport.w}px` : "";
-  return `${index + 1}. **${label}**（${path}${widthPart}）`;
+  return `- **#${item.seq} ${label}**（${path}${widthPart}）`;
 };
 
 const formatTicketTextLines = (item: Item): readonly string[] => [
-  ...(item.before !== undefined ? [`    - 変更前：${truncateForTicket(item.before)}`] : []),
-  ...(item.after !== undefined ? [`    - 変更後：${truncateForTicket(item.after)}`] : []),
+  ...(item.before !== undefined ? [`  - 変更前：${truncateForTicket(item.before)}`] : []),
+  ...(item.after !== undefined ? [`  - 変更後：${truncateForTicket(item.after)}`] : []),
 ];
 
 const formatTicketLinkLines = (item: Item): readonly string[] => [
   ...(item.hrefBefore !== undefined
-    ? [`    - リンク変更前：${truncateForTicket(item.hrefBefore)}`]
+    ? [`  - リンク変更前：${truncateForTicket(item.hrefBefore)}`]
     : []),
   ...(item.hrefAfter !== undefined
-    ? [`    - リンク変更後：${truncateForTicket(item.hrefAfter)}`]
+    ? [`  - リンク変更後：${truncateForTicket(item.hrefAfter)}`]
     : []),
 ];
 
 const formatTicketMetaLines = (item: Item): readonly string[] =>
   (item.meta ?? []).map(
     (m) =>
-      `    - ${formatPageMetaFieldLabel(m.field)}：「${truncateForTicket(m.before)}」→「${truncateForTicket(m.after)}」`,
+      `  - ${formatPageMetaFieldLabel(m.field)}：「${truncateForTicket(m.before)}」→「${truncateForTicket(m.after)}」`,
   );
 
 const formatTicketMemoLines = (item: Item): readonly string[] => {
   const hasMemo = item.memo !== undefined && item.memo.trim().length > 0;
   if (hasMemo && item.memo !== undefined) {
     const suffix = item.changeType === "IMAGE_REPLACE" ? "（新しい画像は HTML 内）" : "";
-    return [`    - メモ：${truncateForTicket(item.memo)}${suffix}`];
+    return [`  - メモ：${truncateForTicket(item.memo)}${suffix}`];
   }
   if (item.changeType === "IMAGE_REPLACE") {
-    return ["    - 差し替え画像：HTML レポート内を参照"];
+    return ["  - 差し替え画像：HTML レポート内を参照"];
   }
   return [];
 };
@@ -123,8 +123,8 @@ export const generateTicketMarkdown = (doc: ChangeRequestDoc): string => {
   const snapshotsById: Record<string, SnapshotMeta> = Object.fromEntries(
     doc.snapshots.map((s) => [s.id, s]),
   );
-  const itemBlocks = doc.items.map((item, idx) => {
-    const header = formatTicketItemHeader(item, idx, snapshotsById);
+  const itemBlocks = doc.items.map((item) => {
+    const header = formatTicketItemHeader(item, snapshotsById);
     const details = formatTicketItemDetails(item);
     return [header, ...details].join("\n");
   });
@@ -138,23 +138,32 @@ export const generateTicketMarkdown = (doc: ChangeRequestDoc): string => {
   ].join("\n");
 };
 
+const longestBacktickRun = (text: string): number =>
+  (text.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+
+/**
+ * 原文をエスケープせずにそのまま渡すためのコードブロック。
+ * AI がリポジトリを文字列検索できるよう、記号や改行を一切加工しない。
+ */
+export const formatRawBlock = (label: string, text: string): readonly string[] => {
+  const fence = "`".repeat(Math.max(3, longestBacktickRun(text) + 1));
+  return [`${label}：`, `${fence}text`, text, fence];
+};
+
 const formatAiAnchorLines = (item: Item): readonly string[] => {
   if (item.anchor.kind === "element") {
     const { locator } = item.anchor;
-    const hasContext = locator.textQuote.prefix.length > 0 || locator.textQuote.suffix.length > 0;
+    const { prefix, suffix } = locator.textQuote;
     return [
-      ...(hasContext
-        ? [
-            `- 前後の文脈：「…${escapeMarkdown(locator.textQuote.prefix)}」｜「${escapeMarkdown(locator.textQuote.suffix)}…」`,
-          ]
-        : []),
-      `- 要素：${locator.tagName}（セレクタの参考：${locator.selector}）`,
+      `- 要素：${locator.tagName}（セレクタの参考：\`${locator.selector}\`）`,
+      ...(prefix.length > 0 ? formatRawBlock("直前の文脈", prefix) : []),
+      ...(suffix.length > 0 ? formatRawBlock("直後の文脈", suffix) : []),
     ];
   }
   if (item.anchor.kind === "region") {
     const { pageRect } = item.anchor;
     return [
-      `- 範囲の基準要素：${item.anchor.container.tagName}（セレクタの参考：${item.anchor.container.selector}、範囲：x=${pageRect.x}, y=${pageRect.y}, w=${pageRect.w}, h=${pageRect.h}）`,
+      `- 範囲の基準要素：${item.anchor.container.tagName}（セレクタの参考：\`${item.anchor.container.selector}\`、範囲：x=${pageRect.x}, y=${pageRect.y}, w=${pageRect.w}, h=${pageRect.h}）`,
     ];
   }
   return [];
@@ -162,7 +171,6 @@ const formatAiAnchorLines = (item: Item): readonly string[] => {
 
 const formatAiItemSection = (
   item: Item,
-  index: number,
   snapshotsById: Readonly<Record<string, SnapshotMeta>>,
 ): string => {
   const label = formatChangeTypeLabel(item.changeType);
@@ -171,25 +179,21 @@ const formatAiItemSection = (
   const widthPart = snap !== undefined ? `（表示幅 ${snap.viewport.w}px）` : "";
 
   const lines: readonly string[] = [
-    `## ${index + 1}. ${label}`,
+    `## #${item.seq} ${label}`,
     `- ページ：${path}${widthPart}`,
-    ...(item.before !== undefined ? [`- 変更前：${escapeMarkdown(item.before)}`] : []),
-    ...(item.after !== undefined ? [`- 変更後：${escapeMarkdown(item.after)}`] : []),
-    ...(item.hrefBefore !== undefined
-      ? [`- リンク変更前：${escapeMarkdown(item.hrefBefore)}`]
-      : []),
-    ...(item.hrefAfter !== undefined ? [`- リンク変更後：${escapeMarkdown(item.hrefAfter)}`] : []),
-    ...(item.meta !== undefined
-      ? item.meta.map(
-          (m) =>
-            `- ${formatPageMetaFieldLabel(m.field)}：「${escapeMarkdown(m.before)}」→「${escapeMarkdown(m.after)}」`,
-        )
-      : []),
     ...(item.changeType === "IMAGE_REPLACE" ? ["- 画像：差し替え画像あり（レポート参照）"] : []),
-    ...(item.memo !== undefined && item.memo.trim().length > 0
-      ? [`- メモ：${escapeMarkdown(item.memo)}`]
-      : []),
     ...formatAiAnchorLines(item),
+    ...(item.before !== undefined ? formatRawBlock("変更前", item.before) : []),
+    ...(item.after !== undefined ? formatRawBlock("変更後", item.after) : []),
+    ...(item.hrefBefore !== undefined ? formatRawBlock("リンク変更前", item.hrefBefore) : []),
+    ...(item.hrefAfter !== undefined ? formatRawBlock("リンク変更後", item.hrefAfter) : []),
+    ...(item.meta ?? []).flatMap((m) => [
+      ...formatRawBlock(`${formatPageMetaFieldLabel(m.field)}（変更前）`, m.before),
+      ...formatRawBlock(`${formatPageMetaFieldLabel(m.field)}（変更後）`, m.after),
+    ]),
+    ...(item.memo !== undefined && item.memo.trim().length > 0
+      ? formatRawBlock("メモ", item.memo)
+      : []),
   ];
   return lines.join("\n");
 };
@@ -198,10 +202,10 @@ export const generateAiInstructionMarkdown = (doc: ChangeRequestDoc): string => 
   const snapshotsById: Record<string, SnapshotMeta> = Object.fromEntries(
     doc.snapshots.map((s) => [s.id, s]),
   );
-  const sections = doc.items.map((item, idx) => formatAiItemSection(item, idx, snapshotsById));
+  const sections = doc.items.map((item) => formatAiItemSection(item, snapshotsById));
 
   return [
-    "以下の変更を行ってください。各項目の「変更前」の文字列でリポジトリを検索し、「前後の文脈」で箇所を絞り込んでください。",
+    "以下の変更を行ってください。各項目の「変更前」の文字列（コードブロック内の原文そのまま）でリポジトリを検索し、「直前・直後の文脈」で箇所を絞り込んでください。",
     "同じ文言が別の表示幅用の要素や他のページにもある場合は、それも報告してください。",
     "共通コンポーネントや CMS・DB 管理の文言だった場合は、変更せずにその旨を報告してください。",
     "",

@@ -2,28 +2,6 @@ import { isDangerousUrl } from "./url-safety";
 
 export const HOST_ELEMENT_ID = "pcr-bookmarklet-host";
 
-const EXCLUDED_PATH_PATTERNS: readonly RegExp[] = [
-  /^\/mypage(\/|$)/i,
-  /^\/account(\/|$)/i,
-  /^\/orders?(\/|$)/i,
-  /^\/history(\/|$)/i,
-  /^\/checkout(\/|$)/i,
-  /^\/cart(\/|$)/i,
-  /^\/payment(\/|$)/i,
-  /^\/profile(\/|$)/i,
-  /^\/settings(\/|$)/i,
-  /^\/address(\/|$)/i,
-];
-
-export const shouldExcludeSnapshotForUrl = (urlStr: string): boolean => {
-  try {
-    const parsed = new URL(urlStr, "https://example.com");
-    return EXCLUDED_PATH_PATTERNS.some((pattern) => pattern.test(parsed.pathname));
-  } catch {
-    return false;
-  }
-};
-
 const PASSTHROUGH_URL_PREFIXES: readonly string[] = ["data:", "blob:", "pcr-res:", "#"];
 
 export const toAbsoluteUrl = (rawUrl: string, baseUrl: string): string => {
